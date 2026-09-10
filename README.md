@@ -18,6 +18,34 @@ One **leader agent** owns every conversation. It answers simple things directly,
 
 ---
 
+## Architecture (the science)
+
+NEXUS implements a **hierarchical supervisor–worker architecture** — centralized orchestration in a **star (hub-and-spoke) topology**:
+
+- Classical MAS taxonomy (Horling & Lesser, *A Survey of Multi-Agent Organizational Paradigms*): a **hierarchy** — one supervisor decomposes tasks and commands subordinates; control is centralized, execution distributed.
+- Industry names for the same pattern: **Orchestrator-Workers** (OpenAI + Anthropic, *Building Effective Agents*) and the **Supervisor pattern** (LangGraph).
+- The workers' radio + joint plan adds **team**-style lateral communication — but authority stays hierarchical: only the leader decides and synthesizes.
+- It is *not* a Contract Net (no bidding), *not* a swarm (no emergent behavior), *not* decentralized.
+
+```text
+                    ┌─────────┐
+                    │  USER   │
+                    └────┬────┘
+                         │
+                  ┌──────▼──────┐
+                  │   LEADER    │  NexusAgent: owns history + tools,
+                  └──┬───┬───┬──┘  writes the ONE final answer per turn
+            ┌────────┘   │   └────────┐
+            ▼            ▼            ▼
+       ┌────────┐  ┌────────┐  ┌────────┐
+       │WORKER 1│  │WORKER 2│  │WORKER 3│  NexusWorker: isolated context,
+       └────┬───┘  └────┬───┘  └────┬───┘  exec/web tools, CANNOT delegate
+            └───────┬───┴───────┬───┘
+               radio bus + joint plan (one DelegateRound per fan-out)
+```
+
+---
+
 ## 1. Requirements
 
 | Need | Details |
