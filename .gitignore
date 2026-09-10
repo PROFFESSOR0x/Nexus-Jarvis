@@ -1,0 +1,7 @@
+# secrets — never commit your real config
+.env
+
+# runtime logs (rotated backups too)
+nexus.log
+nexus.log.*
+.venv/

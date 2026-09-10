@@ -1,0 +1,11 @@
+textual
+rich
+httpx
+python-dotenv
+ddgs
+html2text
+openai
+ollama
+fastapi
+uvicorn[standard]
+psutil

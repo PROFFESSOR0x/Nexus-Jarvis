@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEXUS // JARVIS DECK</title>
+<link rel="stylesheet" href="/static/styles.css?v=8">
+</head>
+<body>
+<header>
+  <span class="logo">&#11042; NEXUS</span><span class="sub">// JARVIS DECK</span>
+  <span class="sp"></span>
+  <span id="hSession" class="dim">session —</span>
+  <span id="hModel" class="dim">model —</span>
+  <span id="hUp" class="dim">up 0s</span>
+  <span id="dateLine" class="dim">—</span>
+  <span><span id="hDot" class="dot"></span> <span id="hState">LINK</span></span>
+  <span id="clock">--:--:--</span>
+</header>
+<main>
+  <div class="col" id="colL">
+    <div class="panel"><h3>SYSTEM <span class="r" id="sysTs"></span></h3>
+      <div class="row"><span>CPU</span><b class="acc" id="cpuPct">—</b></div>
+      <div class="bar" id="cpuBar"><i></i></div>
+      <div class="row"><span>MEM</span><b class="acc" id="memPct">—</b></div>
+      <div class="bar" id="memBar"><i></i></div>
+      <div class="row dim"><span id="memDet">—</span></div>
+      <div class="row"><span>DISK</span><b class="acc" id="diskPct">—</b></div>
+      <div class="bar" id="diskBar"><i></i></div>
+    </div>
+    <div class="panel"><h3>🔧 TOOL I/O <span class="r">live calls</span></h3><div class="feed" id="ioFeed"></div></div>
+    <div class="panel"><h3>NETWORK <span class="r"><span class="acc" id="netDown"></span> / <span class="amber" id="netUp"></span></span></h3>
+      <canvas id="netCanvas" width="270" height="64"></canvas>
+      <div class="row dim"><span>receive</span><span>transmit</span></div>
+    </div>
+    <div class="panel"><h3>LOGS <span class="r">nexus.log</span></h3><div class="feed" id="logFeed"></div></div>
+  </div>
+  <div class="col" id="colC">
+    <div class="panel" id="corePanel"><h3>ENTITY <span class="r">electronic core · <span id="coreState">IDLE</span></span></h3><canvas id="coreCanvas" height="260"></canvas></div>
+    <div class="panel" id="termPanel"><h3>TERMINAL</h3><div class="feed" id="termFeed"></div>
+      <div id="chatRow"><input id="chatIn" dir="auto" placeholder="order NEXUS…  / for commands (Enter to send)" autocomplete="off"><button id="sendBtn">SEND</button></div>
+      <div id="slashHint"></div>
+    </div>
+  </div>
+  <div class="col" id="colR">
+    <div class="panel"><h3>AGENTS <span class="r" id="agCount"></span></h3><div id="agents"></div></div>
+    <div class="panel"><h3>🧠 MEMORY <span class="r">long-term</span></h3><div id="memBox"><div class="dim">loading…</div></div></div>
+    <div class="panel"><h3>COMMS <span class="r">worker radio</span></h3><div class="feed" id="radioFeed"></div></div>
+    <div class="panel"><h3>ACTIVITY <span class="r">tool calls</span></h3><div class="feed" id="actFeed"></div></div>
+    <div class="panel"><h3>THINKING <span class="r">live reasoning</span></h3><div class="feed" id="thinkFeed"></div></div>
+  </div>
+</main>
+<script src="/static/app.js?v=8"></script>
+</body>
+</html>
