@@ -5,3 +5,4 @@
 nexus.log
 nexus.log.*
 .venv/
+__pycache__/
