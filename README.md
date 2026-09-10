@@ -173,7 +173,6 @@ nexus/
 ├── system_prompt.txt  # leader instructions (mandate, brief framework, lessons)
 ├── nexus.log          # every tool/model/save/result (rotated 2 MB × 3, git-ignored)
 ├── requirements.txt
-├── .env               # your config (git-ignored — never commit!)
 ├── .env.example       # template with safe defaults (commit this instead)
 ├── .gitignore
 ├── LICENSE            # MIT
