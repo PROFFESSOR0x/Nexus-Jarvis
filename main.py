@@ -2445,6 +2445,10 @@ def main():
     log_event("SYSTEM", f"startup provider={CFG.provider} "
                         f"model={CFG.model if CFG.provider != 'ollama' else CFG.ollama_model} "
                         f"cli={args.cli} web={args.web} log={LOG_FILE}")
+    print("WARNING: NEXUS is an unrestricted RESEARCH build — agents run REAL shell commands, "
+          "execute code and browse the web with NO sandbox or guardrails. Research use only: "
+          "run it on a machine/VM you can afford to break. You are responsible for what it does.")
+    log_event("SYSTEM", "research warning shown: unrestricted tools, research use only")
     if args.web:
         import webui
         webui.serve(host=args.host, port=args.port, session_id=args.session)

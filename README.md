@@ -14,6 +14,8 @@ One **leader agent** owns every conversation. It answers simple things directly,
 
 > Arabic docs: [README.ar.md](README.ar.md)
 
+> ⚠️ **RESEARCH WARNING — READ FIRST:** NEXUS agents operate **without restrictions**: they run real shell commands, execute arbitrary code, and browse the web with **no sandbox, no approval gates, no guardrails**. This project is **purely for research**. Run it only on a machine or VM you can afford to break, never on production systems or alongside sensitive data/credentials. **You are solely responsible for everything the agents do.**
+
 ---
 
 ## 1. Requirements
@@ -169,9 +171,14 @@ nexus/
 │   ├── app.js
 │   └── styles.css
 ├── system_prompt.txt  # leader instructions (mandate, brief framework, lessons)
-├── nexus.log          # every tool/model/save/result (rotated 2 MB × 3)
+├── nexus.log          # every tool/model/save/result (rotated 2 MB × 3, git-ignored)
 ├── requirements.txt
-└── .env               # your config
+├── .env               # your config (git-ignored — never commit!)
+├── .env.example       # template with safe defaults (commit this instead)
+├── .gitignore
+├── LICENSE            # MIT
+├── README.md          # this file (English)
+└── README.ar.md       # Arabic docs
 ```
 
 Runtime data lives outside the repo: sessions in `~/.nexus/sessions/{id}/` (`session.json`, `context.json`, `workspace/`), memory in `~/.nexus/memory.json`.

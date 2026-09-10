@@ -6,3 +6,4 @@ nexus.log
 nexus.log.*
 .venv/
 __pycache__/
+.gitignore
