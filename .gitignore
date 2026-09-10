@@ -4,6 +4,8 @@
 # runtime logs (rotated backups too)
 nexus.log
 nexus.log.*
-.venv/
+
+# python noise
 __pycache__/
-.gitignore
+*.pyc
+.venv/

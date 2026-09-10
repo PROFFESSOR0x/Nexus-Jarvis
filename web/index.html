@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NEXUS // JARVIS DECK</title>
-<link rel="stylesheet" href="/static/styles.css?v=8">
+<link rel="stylesheet" href="/static/styles.css?v=9">
 </head>
 <body>
 <header>
@@ -37,7 +37,7 @@
   </div>
   <div class="col" id="colC">
     <div class="panel" id="corePanel"><h3>ENTITY <span class="r">electronic core · <span id="coreState">IDLE</span></span></h3><canvas id="coreCanvas" height="260"></canvas></div>
-    <div class="panel" id="termPanel"><h3>TERMINAL</h3><div class="feed" id="termFeed"></div>
+    <div class="panel" id="termPanel"><h3>TERMINAL <span class="r"><button id="upBtn" title="Upload files to this session's workspace">📎 upload</button><input type="file" id="fileIn" multiple hidden></span></h3><div class="feed" id="termFeed"></div>
       <div id="chatRow"><input id="chatIn" dir="auto" placeholder="order NEXUS…  / for commands (Enter to send)" autocomplete="off"><button id="sendBtn">SEND</button></div>
       <div id="slashHint"></div>
     </div>
@@ -48,8 +48,10 @@
     <div class="panel"><h3>COMMS <span class="r">worker radio</span></h3><div class="feed" id="radioFeed"></div></div>
     <div class="panel"><h3>ACTIVITY <span class="r">tool calls</span></h3><div class="feed" id="actFeed"></div></div>
     <div class="panel"><h3>THINKING <span class="r">live reasoning</span></h3><div class="feed" id="thinkFeed"></div></div>
+    <div class="panel"><h3>🧬 EVOLUTION <span class="r" id="evoVer">v?</span></h3><div id="evoBox"><div class="dim">loading…</div></div></div>
   </div>
 </main>
-<script src="/static/app.js?v=8"></script>
+<div id="dropHint">Drop files to upload to this session's workspace</div>
+<script src="/static/app.js?v=9"></script>
 </body>
 </html>

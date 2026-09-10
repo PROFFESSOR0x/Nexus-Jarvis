@@ -8,4 +8,5 @@ openai
 ollama
 fastapi
 uvicorn[standard]
+python-multipart
 psutil

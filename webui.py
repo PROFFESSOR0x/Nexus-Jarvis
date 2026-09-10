@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import psutil
-from fastapi import FastAPI, HTTPException, WebSocket
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -24,6 +24,26 @@ import main as nexus
 from main import CFG, LOG_FILE, LLMProvider, NexusAgent, SessionManager, get_log_tail, log_event
 
 WEB_DIR = Path(__file__).parent / "web"
+UPLOAD_MAX_BYTES = 50_000_000  # per file
+
+
+def safe_upload_name(raw: str) -> str:
+    """Basename-only sanitizer: kills traversal (../../x) and absolute paths."""
+    name = Path(raw or "").name.strip().strip(".")
+    return name[:120]
+
+
+def _unique_path(ws: Path, name: str) -> Path:
+    p = ws / name
+    if not p.exists():
+        return p
+    stem, suffix = Path(name).stem, Path(name).suffix
+    i = 1
+    while True:
+        cand = ws / f"{stem}_{i}{suffix}"
+        if not cand.exists():
+            return cand
+        i += 1
 
 
 def _safe(obj: Any) -> Any:
@@ -254,6 +274,70 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
     @app.get("/api/commands")
     async def api_commands():
         return {"commands": nexus.SLASH_COMMANDS}
+
+    @app.post("/api/upload")
+    async def api_upload(files: List[UploadFile] = File(...)):
+        """Button + drag-and-drop uploads. Saved into THIS session's workspace
+        (its own folder; agents are not confined to it). Agent is told next turn."""
+        sid = app.state.sid  # always current (switch-safe; closure would go stale)
+        ws = sm.workspace(sid)
+        try:
+            ws.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise HTTPException(500, f"workspace unavailable: {e}")
+        saved, errors = [], []
+        for f in files or []:
+            name = safe_upload_name(f.filename or "")
+            if not name:
+                errors.append({"name": f.filename or "?", "error": "empty filename"})
+                continue
+            try:
+                dest = _unique_path(ws, name)
+                size = 0
+                with dest.open("wb") as out:
+                    while True:
+                        chunk = await f.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > UPLOAD_MAX_BYTES:
+                            raise ValueError(f"over {UPLOAD_MAX_BYTES // 1000000}MB cap")
+                        out.write(chunk)
+                saved.append({"name": dest.name, "size": size,
+                              "path": str(dest.relative_to(ws))})
+                try:
+                    # current agent (not the boot-time closure): pending note drains next turn
+                    app.state.agent.pending_files.append({"name": dest.name, "size": size})
+                except Exception:
+                    pass
+            except Exception as e:
+                errors.append({"name": name, "error": str(e)[:200]})
+            finally:
+                try:
+                    await f.close()
+                except Exception:
+                    pass
+        log_event("SAVE", f"upload sid={sid} saved={len(saved)} errors={len(errors)} "
+                          f"files={[s['name'] for s in saved]}")
+        hub.listener("upload", {"sid": sid, "workspace": str(ws),
+                                "saved": saved, "errors": errors})
+        return {"saved": saved, "errors": errors, "workspace": str(ws)}
+
+    @app.get("/api/evolution")
+    async def api_evolution():
+        try:
+            import evolution
+            h = evolution.history()
+            return {"version": h.get("current", "?"),
+                    "rules": h.get("rules", []),
+                    "transitions": h.get("transitions", [])[-8:],
+                    "recent_cycles": h.get("recent_cycles", []),
+                    "recent_runs": evolution.recent_runs(),
+                    "repo_files": evolution.repo_file_count(),
+                    "defects": evolution.aggregate_defects()[:5],
+                    "state": evolution.runtime_state()}
+        except Exception as e:
+            raise HTTPException(500, str(e))
 
     @app.post("/api/chat")
     async def api_chat(body: ChatIn):

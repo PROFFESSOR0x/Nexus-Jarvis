@@ -169,9 +169,46 @@ The deck refuses to start if the port is already taken (split-brain guard) — k
 
 **Delegation, briefly:** the leader must fan out at 2+ independent workstreams (ONE `agent.delegate` call), using the ROLE/GOAL/CONTEXT/METHOD/OUTPUT/TALK brief framework. Workers share a radio (`agent.say`) and a joint plan (`agent.plan`), can never delegate further, and their completions are logged as `[SUBAGENT]` — exactly one `[AGENT] final` per turn.
 
+**Self-evolution:** every turn is recorded as a structured run (`~/.nexus/evolution/runs/`), the repo is indexed (files/symbols/imports/hashes) with snapshots + git info, and `/evolve` runs an evolution cycle — mine failures/retries, judge fact-vs-rule, store anchored repo memories, version the prompt (`v001…`, rollback supported). Generations advance automatically (every 10 turns or on failure patterns). See `/evolve history`, `/evolve why vNNN`, `/evolve revalidate`, and §6 below.
+
 ---
 
-## 6. Web deck panels
+## 6. Self-Evolution (the agent behind the agent)
+
+NEXUS improves itself from evidence. The loop:
+
+1. **Record** — every turn becomes `~/.nexus/evolution/runs/{run_id}.json`: plans, thoughts, `command`/`tool_call`/`tool_error`, auto-detected `test_passed/failed`, `retry` flags, delegation, radio, plan ops, workspace file diffs (`file_created/modified/deleted`), errors, final.
+2. **Index** — the repo is mapped to files/symbols/imports/exports with content hashes; snapshots (last 5) plus git HEAD/dirty/log give exact before/after diffs.
+3. **Mine** — `/evolve` (or auto-trigger) collects observations: repeated failures, retry loops, timeouts, budget hits, silent workers, delegate yields.
+4. **Judge** — one LLM call classifies each observation: **fact** (durable repo truth → memory with file+symbol+line+hash+anchor evidence; evidence is mandatory), **rule** (repeated behavioral defect → new prompt version), or **noise** (transients are never rules; near-duplicates are skipped).
+5. **Advance** — facts land in `memory.jsonl`, rules become `prompts/vNNN.md` (full snapshots, rollback anytime), and a commit writes `{event: "evolution.completed", generation, prompt_version, memory_version}`. The next turn automatically loads the new prompt plus retrieved relevant memories.
+
+**Store layout** (`~/.nexus/evolution/`):
+
+```text
+prompts/current.md  v001.md  v002.md …  rules.jsonl
+evolution.jsonl     cycles.jsonl        decisions.jsonl
+memory.jsonl        failures.jsonl      changes.jsonl
+files.json          snapshots/          runs/  state.json
+```
+
+**Commands:**
+
+| Command | Effect |
+| ------- | ------ |
+| `/evolve` | Run one evolution cycle now |
+| `/evolve history` | Prompt versions, transitions, active rules |
+| `/evolve rollback vNNN` | Restore a prompt version (rules newer than it deactivate) |
+| `/evolve why vNNN` | Lineage: why the prompt says this — rule → linked failures → memories → record |
+| `/evolve revalidate` | Re-resolve every memory anchor against current files (moved/stale tracking) |
+
+**Automatic loop** (no human needed): after each turn the runtime checks — every `EVOLVE_EVERY_TURNS` (default 10) or on failure patterns (2+ worker budget-exhaustions or 3+ tool errors in a turn, `EVOLVE_ON_FAILURE`) — and runs a cycle in the background. Master switch: `EVOLVE_AUTO=0`.
+
+**Memory hygiene:** memories carry content excerpts + hashes + anchors, so references survive line drift; `revalidate` relocates them, `check_drift` flags prompt rules whose evidence files changed. The 🧬 panel shows version, generation, defects and recent cycles live.
+
+---
+
+## 7. Web deck panels
 
 | Panel | Shows |
 | ----- | ----- |
@@ -188,7 +225,7 @@ The deck refuses to start if the port is already taken (split-brain guard) — k
 
 ---
 
-## 7. Project structure
+## 8. Project structure
 
 ```text
 nexus/
@@ -212,7 +249,7 @@ Runtime data lives outside the repo: sessions in `~/.nexus/sessions/{id}/` (`ses
 
 ---
 
-## 8. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause / fix |
 | ------- | ----------- |
@@ -225,7 +262,7 @@ Runtime data lives outside the repo: sessions in `~/.nexus/sessions/{id}/` (`ses
 
 ---
 
-## 9. Notes
+## 10. Notes
 
 - Workers can read memory but only the leader writes it.
 - Tool results are truncated in history (20–50 KB caps) to protect context.

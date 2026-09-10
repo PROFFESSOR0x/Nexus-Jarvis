@@ -738,6 +738,9 @@ async def execute_tool(name: str, params: dict, session_workspace: str = None) -
     try:
         if name == "exec.code":
             params = {**params, "session_workspace": session_workspace}
+        if name == "exec.shell" and session_workspace and not (params or {}).get("cwd"):
+            # Session workspace is the home base (agents may still use absolute paths).
+            params = {**(params or {}), "cwd": session_workspace}
         result = await fn(**params)
     except TypeError as e:
         result = {"success": False, "error": f"Invalid params for {name}: {e}"}
@@ -1331,10 +1334,21 @@ class NexusAgent:
         # the model with N system prompts after N turns.
         self.history: List[dict] = [{"role": "system", "content": self.system_prompt}]
         self.round_n = 0  # delegation round counter (R1, R2, … per session)
+        self.turn_n = 0  # leader turns this session (run_id seed for evolution runs)
+        self._evo_rec = None  # EvolutionRecorder (lazy, never breaks the loop)
+        self.pending_files: List[dict] = []  # uploads waiting for next turn [{name,size}]
         self.on_event: Optional[Callable] = None  # callback for TUI (legacy single)
         self.listeners: List[Callable] = []  # extra fan-out targets (e.g. web UI bus)
+        try:
+            import evolution
+            _rec = evolution.EvolutionRecorder()
+            self._evo_rec = _rec
+            _me = self
+            self.add_listener(lambda e, d: _rec.listener(_me.sid, e, d))
+        except Exception:
+            pass
 
-    def _build_system_prompt(self) -> str:
+    def _build_system_prompt(self, evo_base=None) -> str:
         base = CFG.system_prompt_path.read_text(encoding="utf-8") if CFG.system_prompt_path.exists() else "You are NEXUS."
         env = self.env
         shells = ", ".join(s["name"] for s in env["shells"])
@@ -1351,7 +1365,27 @@ Session ID: {self.sid}
 # ── LONG-TERM MEMORY (user profile + durable facts) ──
 {MEM.context_block()}
 """
+        try:
+            # Self-evolution layer: base prompt + learned rules (versioned).
+            # Falls back to base text silently if the store is absent/broken.
+            import evolution
+            base = evolution.active_prompt_text(base, evo_base or evolution.EVODIR)
+        except Exception as e:
+            log_event("AGENT", f"evolution layer skipped: {e}", level="DEBUG")
         return base + ctx
+
+    def _refresh_system(self, extra_context: str = "", evo_base=None):
+        """Rebuild history[0] so a long-lived agent picks up evolved rules,
+        fresh date, and per-turn retrieved memories. Never raises."""
+        try:
+            self.system_prompt = self._build_system_prompt(evo_base)
+            sys_text = self.system_prompt + (("\n\n" + extra_context) if extra_context else "")
+            if self.history and self.history[0].get("role") == "system":
+                self.history[0] = {"role": "system", "content": sys_text}
+            else:
+                self.history.insert(0, {"role": "system", "content": sys_text})
+        except Exception as e:
+            log_event("AGENT", f"system refresh failed: {e}", level="DEBUG")
 
     def add_listener(self, fn: Callable):
         """Attach another event consumer (web UI bus). Never raises."""
@@ -1390,8 +1424,31 @@ Session ID: {self.sid}
     async def run(self, user_input: str) -> str:
         """Main leader loop. Returns the ONE final response for this turn."""
         log_event("AGENT", f"run start sid={self.sid} input={_short(user_input, 500)!r}")
+        self.turn_n = getattr(self, "turn_n", 0) + 1
+        try:
+            import evolution
+            evo_base = getattr(self, "evo_base", None) or evolution.EVODIR
+            mem_block = evolution.retrieve(user_input, evo_base)
+            if mem_block:
+                log_event("AGENT", f"injected {len(mem_block)} chars of repo memory sid={self.sid}",
+                          level="DEBUG")
+            self._refresh_system(mem_block, evo_base)
+            if self._evo_rec:
+                self._evo_rec.run_start(self.sid, self.turn_n, user_input, self.workspace)
+        except Exception as e:
+            log_event("AGENT", f"turn preamble failed: {e}", level="DEBUG")
         self.history.append({"role": "user", "content": user_input})
         self.sm.add_message(self.sid, "user", user_input)
+        pending = getattr(self, "pending_files", None) or []
+        if pending:
+            # Files uploaded (button / drag-and-drop) since last turn.
+            self.pending_files = []
+            names = ", ".join(f"{p.get('name', '?')} ({p.get('size', 0)} bytes)" for p in pending)
+            note = ("[Files uploaded to the session workspace since your last turn: " + names +
+                    ". They are inside the session workspace directory.]")
+            self.history.append({"role": "user", "content": note})
+            self.sm.add_message(self.sid, "user", note)
+            log_event("AGENT", f"injected {len(pending)} uploaded file(s) sid={self.sid}")
         self._delegate_rounds = 0  # per-turn delegation budget
 
         final = ""
@@ -1419,7 +1476,7 @@ Session ID: {self.sid}
                                _short(content, 2000))
                 self.history.append({"role": "assistant", "content": final})
                 self.sm.add_message(self.sid, "assistant", final)
-                self._emit("final", {"content": final})
+                self._emit("final", {"content": final, "workspace": self.workspace})
                 break
 
             # Record assistant message with tool calls
@@ -1456,7 +1513,46 @@ Session ID: {self.sid}
         if not final:
             log_event("AGENT", f"run exhausted max_iterations={CFG.max_iterations} sid={self.sid}", level="WARNING")
             log_result("agent", f"exhausted max_iterations sid={self.sid}", None, level="WARNING")
+        try:
+            import evolution
+            evo_base = getattr(self, "evo_base", None) or evolution.EVODIR
+            evolution.note_turn_completed(evo_base)
+            self._maybe_auto_evolve()
+        except Exception as e:
+            log_event("AGENT", f"turn epilogue failed: {e}", level="DEBUG")
         return final
+
+    def _maybe_auto_evolve(self):
+        """Phase 5/10: background evolution cycle when due — never blocks the turn."""
+        try:
+            import evolution
+            if getattr(self, "_evolving", False):
+                return
+            evo_base = getattr(self, "evo_base", None) or evolution.EVODIR
+            last = evolution.last_run_summary(self.sid, evo_base)
+            ok, reason = evolution.should_auto_evolve(last, evo_base)
+            if not ok:
+                return
+            self._evolving = True
+            log_event("EVOLVE", f"auto trigger ({reason}) sid={self.sid}")
+            _me = self
+
+            async def _bg():
+                try:
+                    base_text = CFG.system_prompt_path.read_text(encoding="utf-8") \
+                        if CFG.system_prompt_path.exists() else "You are NEXUS."
+                    await evolution.evolve_once(
+                        _me.sm.root, Path(__file__).parent, base_text, _me.llm,
+                        base=evo_base, task_ref=f"auto:{_me.sid[:8]}t{_me.turn_n}",
+                        log_fn=lambda m: log_event("EVOLVE", str(m)[:200]))
+                except Exception as e:
+                    log_event("EVOLVE", f"auto cycle failed: {e}", level="ERROR")
+                finally:
+                    _me._evolving = False
+
+            asyncio.create_task(_bg())
+        except Exception:
+            pass
 
     async def _exec_leader_call(self, tc: dict):
         """Execute one leader tool call. agent.delegate fans out to workers;
@@ -1740,6 +1836,7 @@ SLASH_COMMANDS = [
     {"cmd": "/model", "usage": "/model <name>", "desc": "Switch model live"},
     {"cmd": "/thinking", "usage": "/thinking [low|medium|high]", "desc": "Show/set reasoning effort"},
     {"cmd": "/memory", "usage": "/memory", "desc": "Show what NEXUS remembers about you"},
+    {"cmd": "/evolve", "usage": "/evolve [history|rollback N|why vNNN|revalidate]", "desc": "Run self-evolution cycle / versions"},
     {"cmd": "/clear", "usage": "/clear", "desc": "Clear the screen (local)"},
     {"cmd": "/help", "usage": "/help", "desc": "This list"},
 ]
@@ -1907,6 +2004,77 @@ async def handle_slash(text: str, ctx: dict) -> dict:
 
         if cmd == "/clear":
             return {"handled": True, "reply": "", "action": "clear"}
+
+        if cmd == "/evolve":
+            import evolution
+            from pathlib import Path as _P
+            repo = _P(__file__).parent
+            sub = (arg or "").strip().split()
+            if sub and sub[0].lower() == "history":
+                h = evolution.history()
+                lines = [f"Prompt **{h['current']}** · {len(h['rules'])} active rules"]
+                for t in h["transitions"][-8:]:
+                    lines.append(f"- `{t.get('ts', '')[:16]}` {t.get('kind')}: "
+                                 f"{t.get('from', '?')} → {t.get('to', '?')} — "
+                                 f"{str(t.get('reason', ''))[:100]}")
+                return {"handled": True, "reply": "\n".join(lines), "action": None}
+            if sub and sub[0].lower() == "rollback" and len(sub) > 1:
+                base_text = CFG.system_prompt_path.read_text(encoding="utf-8") \
+                    if CFG.system_prompt_path.exists() else "You are NEXUS."
+                r = evolution.rollback(base_text, sub[1])
+                if not r.get("ok"):
+                    return {"handled": True, "reply": f"Rollback failed: {r.get('error')}", "action": None}
+                return {"handled": True,
+                        "reply": f"Prompt rolled back to **{r['to']}** "
+                                 f"({r['active_rules']} active rules). New sessions use it immediately.",
+                        "action": None}
+            if sub and sub[0].lower() == "why" and len(sub) > 1:
+                import evolution as _evo_why
+                lin = _evo_why.lineage_for_rule(sub[1])
+                if not lin.get("ok"):
+                    return {"handled": True, "reply": f"Lineage failed: {lin.get('error')}", "action": None}
+                out = [f"**Why does the prompt say this?** (`{lin['version']}`)",
+                       f"Rule: {lin['rule'][:300]}",
+                       f"Reason: {lin['reason'][:200]}"]
+                if lin.get("linked_failures"):
+                    out.append("Linked failures:")
+                    out += [f"- `{f.get('ts', '')[:16]}` {f.get('kind')}: {f.get('detail', '')[:120]}"
+                            for f in lin["linked_failures"]]
+                if lin.get("linked_memories"):
+                    out.append("Linked memories:")
+                    out += [f"- `{m.get('id')}` [{m.get('type')}] {m.get('content', '')[:120]}"
+                            for m in lin["linked_memories"]]
+                ev = lin.get("evolution_record", {}) or {}
+                if ev.get("ts"):
+                    out.append(f"Recorded {ev.get('ts', '')[:16]} (gen evolution).")
+                return {"handled": True, "reply": "\n".join(out), "action": None}
+            if sub and sub[0].lower() == "revalidate":
+                import evolution
+                from pathlib import Path as _P2
+                v = evolution.revalidate(_P2(__file__).parent)
+                return {"handled": True,
+                        "reply": f"Memory revalidated against current files: "
+                                 f"{v['reconfirmed']} ok, {v['moved']} moved, "
+                                 f"{v['stale']} stale, {v['skipped']} skipped "
+                                 f"({v['total']} total).",
+                        "action": None}
+            llm = LLMProvider()
+            base_text = CFG.system_prompt_path.read_text(encoding="utf-8") \
+                if CFG.system_prompt_path.exists() else "You are NEXUS."
+            cycle = await evolution.evolve_once(
+                sm.root, repo, base_text, llm,
+                task_ref=f"slash:{sid[:8]}",
+                log_fn=lambda m: log_event("EVOLVE", str(m)[:200]))
+            ap = cycle.get("applied", {})
+            lines = [f"Evolution cycle done — prompt **{cycle.get('prompt_before')} → "
+                     f"{cycle.get('prompt_after')}**",
+                     f"observations: {len(cycle.get('observations', []))}, "
+                     f"facts: {len(ap.get('facts', []))}, rules: {len(ap.get('rules', []))}, "
+                     f"skipped: {ap.get('skipped', 0)}, repo changes: {cycle.get('repo_changes', 0)}"]
+            for d in (cycle.get("decisions", []) or [])[:6]:
+                if d.get("verdict") in ("fact", "rule"):
+                    lines.append(f"- [{d['verdict']}] {str(d.get('text', ''))[:140]}")
+            return {"handled": True, "reply": "\n".join(lines), "action": None}
 
         return {"handled": False, "reply": "", "action": None}
     except Exception as e:
