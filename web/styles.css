@@ -82,12 +82,12 @@ table.procs td:last-child, table.procs td:nth-child(2) { text-align: right; }
 pre { background: #02181c; border: 1px solid var(--line); padding: 6px; overflow-x: auto; margin: 4px 0; }
 code { color: var(--amber); }
 pre code { color: var(--txt); }
-#termFeed { min-height: 120px; max-height: 300px; }
 #termFeed .msg.you { border-color: #7c3aed; }
 #termFeed .msg.nexus { border-color: var(--acc); }
 #termFeed .msg h4 { margin: 4px 0; color: var(--acc); }
 #termFeed .msg ul { margin: 4px 0; padding-left: 18px; }
-#termPanel { position: sticky; bottom: 0; background: rgba(8, 28, 32, 0.97); z-index: 4; }
+#termPanel { position: sticky; bottom: 0; background: rgba(8, 28, 32, 0.97); z-index: 4; flex: 1; display: flex; flex-direction: column; min-height: 340px; }
+#termFeed { flex: 1; min-height: 300px; max-height: none; }
 #chatRow { display: flex; gap: 6px; margin-top: 6px; background: inherit; }
 #slashHint {
   position: absolute; bottom: 48px; left: 10px; right: 10px; z-index: 6;
