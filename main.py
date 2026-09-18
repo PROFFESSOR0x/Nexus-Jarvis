@@ -436,8 +436,19 @@ class SessionManager:
 
     def list_sessions(self) -> List[dict]:
         sessions = []
-        for d in sorted(self.root.iterdir(), reverse=True):
-            if d.is_dir() and (d / "session.json").exists():
+        try:
+            dirs = sorted(
+                [d for d in self.root.iterdir() if d.is_dir()],
+                key=lambda d: d.stat().st_mtime if d.exists() else 0,
+                reverse=True,
+            )
+        except Exception:
+            try:
+                dirs = sorted(self.root.iterdir(), reverse=True)
+            except Exception:
+                return []
+        for d in dirs:
+            if (d / "session.json").exists():
                 try:
                     meta = json.loads((d / "session.json").read_text())
                     sessions.append(meta)
@@ -1830,10 +1841,14 @@ class NexusWorker:
 SLASH_COMMANDS = [
     {"cmd": "/new", "usage": "/new", "desc": "Start a new session"},
     {"cmd": "/sessions", "usage": "/sessions", "desc": "List old conversations"},
-    {"cmd": "/open", "usage": "/open <id…>", "desc": "Switch to an old conversation"},
-    {"cmd": "/delete", "usage": "/delete <id…>", "desc": "Delete a conversation (not the active one)"},
-    {"cmd": "/models", "usage": "/models", "desc": "List available models"},
-    {"cmd": "/model", "usage": "/model <name>", "desc": "Switch model live"},
+    {"cmd": "/open", "usage": "/open <id|number>", "desc": "Switch to an old conversation"},
+    {"cmd": "/delete", "usage": "/delete <id|number>", "desc": "Delete a conversation (not the active one)"},
+    {"cmd": "/models", "usage": "/models [ollama|openai|all]", "desc": "List available models (live from providers)"},
+    {"cmd": "/model", "usage": "/model <name>", "desc": "Switch model live (validated against live list)"},
+    {"cmd": "/provider", "usage": "/provider [ollama|openai]", "desc": "Show/switch LLM provider live"},
+    {"cmd": "/base-url", "usage": "/base-url <url>", "desc": "Show/set OpenAI-compatible base URL"},
+    {"cmd": "/key", "usage": "/key <sk-...>", "desc": "Set OpenAI-compatible API key (masked, saved to .env)"},
+    {"cmd": "/ollama-host", "usage": "/ollama-host <url>", "desc": "Show/set Ollama host URL"},
     {"cmd": "/thinking", "usage": "/thinking [low|medium|high]", "desc": "Show/set reasoning effort"},
     {"cmd": "/memory", "usage": "/memory", "desc": "Show what NEXUS remembers about you"},
     {"cmd": "/evolve", "usage": "/evolve [history|rollback N|why vNNN|revalidate]", "desc": "Run self-evolution cycle / versions"},
@@ -1849,7 +1864,10 @@ def update_env_file(key: str, value: str):
         lines = p.read_text(encoding="utf-8").splitlines() if p.exists() else []
         out, done = [], False
         for ln in lines:
-            if ln.strip().startswith(key + "=") and not done:
+            s = ln.strip()
+            # Match KEY= and #KEY= (commented example lines) so toggling works.
+            target = s[1:].strip() if s.startswith("#") else s
+            if target.startswith(key + "=") and not done:
                 out.append(f"{key}={value}")
                 done = True
             else:
@@ -1861,25 +1879,147 @@ def update_env_file(key: str, value: str):
         log_event("SYSTEM", f"env persist {key} failed: {e}", level="WARNING")
 
 
+def _normalize_openai_base(raw: str) -> str:
+    """Normalize an OpenAI-compatible base URL. Never raises."""
+    try:
+        u = (raw or "").strip().strip('"').strip("'")
+        if not u:
+            return "https://api.openai.com/v1"
+        # Users paste full chat URLs — trim to the API root.
+        for suffix in ("/chat/completions", "/completions", "/responses"):
+            if u.endswith(suffix):
+                u = u[: -len(suffix)]
+        u = u.rstrip("/")
+        if not u.startswith(("http://", "https://")):
+            low = u.lower()
+            local = (low.startswith("localhost") or low.startswith("127.")
+                     or low.startswith("0.0.0.0") or low.startswith("192.168.")
+                     or low.startswith("10.") or low.startswith("[::1]"))
+            u = ("http://" if local else "https://") + u
+        return u.rstrip("/") or "https://api.openai.com/v1"
+    except Exception:
+        return "https://api.openai.com/v1"
+
+
+def _mask_key(key: str) -> str:
+    try:
+        k = (key or "").strip()
+        if not k:
+            return "(empty)"
+        if len(k) <= 8:
+            return "***"
+        return f"{k[:4]}…{k[-4:]}"
+    except Exception:
+        return "***"
+
+
 def _match_session(sm: SessionManager, prefix: str):
-    """Resolve an id prefix to one session. Returns (sid, error_reply)."""
+    """Resolve an id prefix OR a 1-based number from `/sessions` to one session.
+
+    Returns (sid, error_reply). Numbers refer to the same newest-first order
+    `/sessions` prints, so `/open 1` opens the most recent conversation.
+    """
     prefix = (prefix or "").strip()
     if not prefix:
-        return None, "Usage: `/open <id…>` — see `/sessions`."
-    cands = [s for s in sm.list_sessions() if s.get("id", "").startswith(prefix)]
+        return None, "Usage: `/open <id|number>` — see `/sessions`."
+    try:
+        sessions = sm.list_sessions()
+    except Exception as e:
+        return None, f"Can't list sessions: {e}"
+    if not sessions:
+        return None, "No conversations yet."
+    # Numeric shortcut: `/open 1` .. `/open 10`
+    if prefix.isdigit():
+        idx = int(prefix) - 1
+        if 0 <= idx < min(len(sessions), 10):
+            return sessions[idx].get("id"), ""
+        return None, f"No session number `{prefix}` — see `/sessions` (1–{min(len(sessions), 10)})."
+    cands = [s for s in sessions if s.get("id", "").startswith(prefix)]
     if not cands:
-        return None, f"No session starts with `{prefix}`."
+        # also try substring match on the id for convenience
+        cands = [s for s in sessions if prefix in s.get("id", "")]
+    if not cands:
+        return None, f"No session starts with `{prefix}` — see `/sessions`."
     if len(cands) > 1:
         lines = "\n".join(f"- `{s['id']}` — {s.get('title', '')}" for s in cands[:8])
         return None, f"Ambiguous — matches {len(cands)}:\n{lines}\nBe more specific."
     return cands[0]["id"], ""
 
 
-def _ollama_models() -> List[str]:
+async def _fetch_ollama_models(host: Optional[str] = None) -> dict:
+    """Live list from Ollama `GET {host}/api/tags`. Never raises.
+
+    Returns {"models": [names...], "error": str|None, "host": str}.
+    """
+    h = _normalize_ollama_host(host or CFG.ollama_host)
     try:
-        import httpx
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get(f"{h}/api/tags")
+            r.raise_for_status()
+            data = r.json()
+        raw = data.get("models", []) if isinstance(data, dict) else []
+        names = sorted(m.get("name", "") for m in raw if isinstance(m, dict) and m.get("name"))
+        log_event("PROVIDER", f"ollama models ok host={h} count={len(names)}")
+        return {"models": names, "error": None, "host": h}
+    except Exception as e:
+        err = str(e)[:220] or type(e).__name__
+        log_event("PROVIDER", f"ollama models FAIL host={h}: {err}", level="WARNING")
+        return {"models": [], "error": err, "host": h}
+
+
+async def _fetch_openai_models(base_url: Optional[str] = None,
+                               api_key: Optional[str] = None) -> dict:
+    """Live list from an OpenAI-compatible `GET {base}/models`. Never raises.
+
+    Works for OpenAI, OpenRouter, LM Studio, vLLM, Ollama-compat, etc.
+    Returns {"models": [ids...], "error": str|None, "base_url": str, "status": int|None}.
+    """
+    base = _normalize_openai_base(base_url or CFG.base_url)
+    key = (api_key if api_key is not None else CFG.api_key) or ""
+    headers = {"User-Agent": "NEXUS/1.0"}
+    if key.strip():
+        headers["Authorization"] = f"Bearer {key.strip()}"
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            r = await client.get(f"{base}/models", headers=headers)
+            status = r.status_code
+            if status == 401:
+                msg = "401 Unauthorized — bad/missing API key (set with `/key <sk-...>`)."
+                log_event("PROVIDER", f"openai models {msg} base={base}", level="WARNING")
+                return {"models": [], "error": msg, "base_url": base, "status": status}
+            if status == 404:
+                msg = (f"404 from {base}/models — wrong base URL? "
+                       f"Examples: `https://api.openai.com/v1`, `http://localhost:1234/v1`. "
+                       f"Set with `/base-url <url>`.")
+                log_event("PROVIDER", f"openai models {msg}", level="WARNING")
+                return {"models": [], "error": msg, "base_url": base, "status": status}
+            r.raise_for_status()
+            data = r.json()
+        items = data.get("data", data) if isinstance(data, dict) else data
+        if isinstance(items, dict):
+            items = items.get("data", [])
+        names: List[str] = []
+        if isinstance(items, list):
+            for m in items:
+                if isinstance(m, dict) and m.get("id"):
+                    names.append(str(m["id"]))
+                elif isinstance(m, str):
+                    names.append(m)
+        names = sorted(set(names))
+        log_event("PROVIDER", f"openai models ok base={base} count={len(names)}")
+        return {"models": names, "error": None, "base_url": base, "status": status}
+    except Exception as e:
+        err = str(e)[:220] or type(e).__name__
+        log_event("PROVIDER", f"openai models FAIL base={base}: {err}", level="WARNING")
+        return {"models": [], "error": err, "base_url": base, "status": None}
+
+
+def _ollama_models() -> List[str]:
+    """Sync compat wrapper (blocks briefly). Prefer `_fetch_ollama_models()`."""
+    try:
+        import httpx as _hx
         host = CFG.ollama_host.rstrip("/")
-        r = httpx.get(f"{host}/api/tags", timeout=6)
+        r = _hx.get(f"{host}/api/tags", timeout=6)
         return sorted(m.get("name", "") for m in r.json().get("models", []) if m.get("name"))
     except Exception:
         return []
@@ -1889,28 +2029,40 @@ async def handle_slash(text: str, ctx: dict) -> dict:
     """Parse + execute a slash command. ctx: {sm, sid}. Never raises."""
     try:
         parts = (text or "").strip().split()
-        cmd = parts[0].lower() if parts else ""
+        cmd = (parts[0].lower() if parts else "").split("@")[0]
         arg = " ".join(parts[1:]).strip()
-        sm: SessionManager = ctx.get("sm")
-        sid: str = ctx.get("sid", "")
+        sm: SessionManager = (ctx or {}).get("sm")
+        sid: str = (ctx or {}).get("sid", "") or ""
+        if cmd in ("/new", "/sessions", "/open", "/delete", "/evolve") and sm is None:
+            return {"handled": True, "reply": "Session store unavailable.", "action": None}
 
         if cmd == "/new":
-            nsid = sm.create("interactive")
+            try:
+                nsid = sm.create("interactive")
+            except Exception as e:
+                return {"handled": True, "reply": f"Can't create session: {e}", "action": None}
             log_event("TUI", f"slash /new -> {nsid}")
             return {"handled": True, "reply": f"New session `{nsid}`.", "action": "new", "sid": nsid}
 
         if cmd == "/sessions":
-            sessions = sm.list_sessions()[:10]
+            try:
+                sessions = sm.list_sessions()[:10]
+            except Exception as e:
+                return {"handled": True, "reply": f"Can't list sessions: {e}", "action": None}
             if not sessions:
                 return {"handled": True, "reply": "No conversations yet.", "action": None}
             lines = []
-            for s in sessions:
+            for i, s in enumerate(sessions, 1):
                 mark = " **← active**" if s.get("id") == sid else ""
-                msgs = s.get("messages", [])
+                msgs = s.get("messages", []) or []
                 first = next((m.get("content", "") for m in msgs if m.get("role") == "user"), "")
-                lines.append(f"- `{s['id']}`{mark} — {s.get('title', '')} "
-                             f"({len(msgs)} msgs) {('“' + _short(first, 60) + '”') if first else ''}")
-            return {"handled": True, "reply": "Recent conversations:\n" + "\n".join(lines), "action": None}
+                upd = str(s.get("updated_at", ""))[:16].replace("T", " ")
+                lines.append(f"{i}. `{s['id']}`{mark} — {s.get('title', '')} "
+                             f"({len(msgs)} msgs{(', ' + upd) if upd else ''}) "
+                             f"{('“' + _short(first, 60) + '”') if first else ''}")
+            return {"handled": True,
+                    "reply": "Recent conversations (`/open <number|id>`):\n" + "\n".join(lines),
+                    "action": None}
 
         if cmd == "/open":
             nsid, err = _match_session(sm, arg)
@@ -1923,48 +2075,199 @@ async def handle_slash(text: str, ctx: dict) -> dict:
         if cmd == "/delete":
             nsid, err = _match_session(sm, arg)
             if err:
+                # keep usage hint specific to /delete
+                if err.startswith("Usage: `/open"):
+                    err = err.replace("`/open <id|number>`", "`/delete <id|number>`")
                 return {"handled": True, "reply": err, "action": None}
             if nsid == sid:
                 return {"handled": True,
                         "reply": "Can't delete the active session — `/open` another one first.",
                         "action": None}
             import shutil
-            shutil.rmtree(sm.root / nsid, ignore_errors=True)
+            try:
+                shutil.rmtree(sm.root / nsid, ignore_errors=True)
+            except Exception as e:
+                return {"handled": True, "reply": f"Delete failed: {e}", "action": None}
             log_event("TUI", f"slash /delete {nsid}")
             return {"handled": True, "reply": f"Deleted `{nsid}`.", "action": None}
 
         if cmd == "/models":
-            if CFG.provider == "ollama":
-                names = _ollama_models()
-                cur = CFG.ollama_model
-                if not names:
-                    return {"handled": True, "reply": f"Model list unreachable — current: `{cur}`.",
-                            "action": None}
-                lines = "\n".join(f"- `{n}`" + (" **← active**" if n == cur else "") for n in names)
-                return {"handled": True, "reply": f"Ollama models (`/model <name>`):\n{lines}",
+            which = (arg or "").strip().lower()
+            if which in ("", "current", "here"):
+                which = CFG.provider
+            if which not in ("ollama", "openai", "all"):
+                return {"handled": True,
+                        "reply": f"Usage: `/models [ollama|openai|all]` — got `{arg}`.",
                         "action": None}
-            return {"handled": True, "reply": f"Provider `{CFG.provider}` — current model `{CFG.model}`.\n"
-                                              f"Switch with `/model <name>`.", "action": None}
+
+            async def _section_ollama():
+                res = await _fetch_ollama_models()
+                cur = CFG.ollama_model
+                if res["error"] and not res["models"]:
+                    return (f"**Ollama** ({res['host']}) — unreachable: `{_short(res['error'], 160)}`\n"
+                            f"Current: `{cur}`. Is `ollama serve` running? "
+                            f"Set host with `/ollama-host <url>`.")
+                lines = "\n".join(f"- `{n}`" + (" **← active**" if n == cur else "")
+                                   for n in res["models"])
+                head = f"**Ollama** ({res['host']}) — {len(res['models'])} models (`/model <name>`):"
+                tail = f"\n⚠️ list warning: `{_short(res['error'], 140)}`" if res["error"] else ""
+                return f"{head}\n{lines}{tail}"
+
+            async def _section_openai():
+                res = await _fetch_openai_models()
+                cur = CFG.model
+                if res["error"] and not res["models"]:
+                    return (f"**OpenAI-compatible** ({res['base_url']}) — unreachable: "
+                            f"`{_short(res['error'], 200)}`\n"
+                            f"Current: `{cur}`. Check `/base-url`, `/key`, then `/models openai` again.")
+                lines = "\n".join(f"- `{n}`" + (" **← active**" if n == cur else "")
+                                   for n in res["models"][:100])
+                extra = f"\n…+{len(res['models']) - 100} more" if len(res["models"]) > 100 else ""
+                head = (f"**OpenAI-compatible** ({res['base_url']}) — "
+                        f"{len(res['models'])} models (`/model <name>`):")
+                tail = f"\n⚠️ list warning: `{_short(res['error'], 140)}`" if res["error"] else ""
+                key_hint = "" if (CFG.api_key or "").strip() else "\n⚠️ no API key set — use `/key <sk-...>`."
+                return f"{head}\n{lines}{extra}{tail}{key_hint}"
+
+            if which == "ollama":
+                return {"handled": True, "reply": await _section_ollama(), "action": None}
+            if which == "openai":
+                return {"handled": True, "reply": await _section_openai(), "action": None}
+            # all: fetch both concurrently
+            import asyncio as _aio
+            oll_txt, oai_txt = await _aio.gather(_section_ollama(), _section_openai())
+            return {"handled": True,
+                    "reply": f"{oll_txt}\n\n{oai_txt}\n\nActive provider: `{CFG.provider}` "
+                             f"(switch with `/provider <ollama|openai>`).",
+                    "action": None}
 
         if cmd == "/model":
             if not arg:
                 cur = CFG.ollama_model if CFG.provider == "ollama" else CFG.model
-                return {"handled": True, "reply": f"Current model: `{cur}`. Usage: `/model <name>` "
-                                                  f"(see `/models`).", "action": None}
+                return {"handled": True, "reply": f"Current model (`{CFG.provider}`): `{cur}`. "
+                                                  f"Usage: `/model <name>` (see `/models`).",
+                        "action": None}
+            name = arg.strip().strip('"').strip("'")
             if CFG.provider == "ollama":
-                names = _ollama_models()
-                if names and arg not in names:
-                    close = [n for n in names if arg.lower() in n.lower()]
-                    hint = f"\nDid you mean: {', '.join(f'`{c}`' for c in close[:3])}?" if close else ""
+                res = await _fetch_ollama_models()
+                names = res["models"]
+                if names and name not in names:
+                    close = [n for n in names if name.lower() in n.lower()][:3]
+                    if not close:
+                        # try token overlap for typos like llama3 vs llama3.1
+                        base = name.lower().split(":")[0]
+                        close = [n for n in names if base and base in n.lower()][:3]
+                    hint = f"\nDid you mean: {', '.join(f'`{c}`' for c in close)}?" if close else ""
                     return {"handled": True,
-                            "reply": f"Unknown model `{arg}`.{hint}\nSee `/models`.", "action": None}
-                CFG.ollama_model = arg
-                update_env_file("OLLAMA_MODEL", arg)
+                            "reply": f"Unknown Ollama model `{name}`.{hint}\nSee `/models ollama`.",
+                            "action": None}
+                CFG.ollama_model = name
+                update_env_file("OLLAMA_MODEL", name)
+                warn = (f" (⚠️ list unreachable — switched anyway: "
+                        f"`{_short(res['error'], 120)}`)" if res["error"] and not names else "")
+                log_event("SYSTEM", f"slash /model -> ollama/{name}")
+                return {"handled": True,
+                        "reply": f"Model switched to `{name}` on **ollama** (saved, live now).{warn}",
+                        "action": None}
             else:
-                CFG.model = arg
-                update_env_file("LLM_MODEL", arg)
-            log_event("SYSTEM", f"slash /model -> {arg}")
-            return {"handled": True, "reply": f"Model switched to `{arg}` (saved, live now).",
+                res = await _fetch_openai_models()
+                names = res["models"]
+                if names and name not in names:
+                    close = [n for n in names if name.lower() in n.lower()][:3]
+                    hint = f"\nDid you mean: {', '.join(f'`{c}`' for c in close)}?" if close else ""
+                    return {"handled": True,
+                            "reply": f"Unknown model `{name}` for `{res['base_url']}`.{hint}\n"
+                                     f"See `/models openai`.",
+                            "action": None}
+                CFG.model = name
+                update_env_file("LLM_MODEL", name)
+                warn = (f" (⚠️ list unreachable — switched anyway: "
+                        f"`{_short(res['error'], 140)}`)" if res["error"] and not names else "")
+                log_event("SYSTEM", f"slash /model -> openai/{name}")
+                return {"handled": True,
+                        "reply": f"Model switched to `{name}` on **openai** ({CFG.base_url}) "
+                                 f"(saved, live now).{warn}",
+                        "action": None}
+
+        if cmd == "/provider":
+            want = (arg or "").strip().lower()
+            if not want:
+                cur_model = CFG.ollama_model if CFG.provider == "ollama" else CFG.model
+                return {"handled": True,
+                        "reply": (f"Provider: **{CFG.provider}** — model `{cur_model}`\n"
+                                  f"- ollama host: `{CFG.ollama_host}`\n"
+                                  f"- openai base: `{CFG.base_url}` key: `{_mask_key(CFG.api_key)}`\n"
+                                  f"Switch with `/provider <ollama|openai>`. List with `/models [all]`."),
+                        "action": None}
+            if want not in ("ollama", "openai"):
+                return {"handled": True,
+                        "reply": f"Usage: `/provider <ollama|openai>` — got `{arg}`.",
+                        "action": None}
+            CFG.provider = want
+            update_env_file("LLM_PROVIDER", want)
+            log_event("SYSTEM", f"slash /provider -> {want}")
+            cur_model = CFG.ollama_model if want == "ollama" else CFG.model
+            return {"handled": True,
+                    "reply": f"Provider → **{want}** (model `{cur_model}`, saved, live now). "
+                             f"See `/models {want}`.",
+                    "action": None}
+
+        if cmd in ("/base-url", "/baseurl", "/base_url"):
+            if not arg:
+                return {"handled": True,
+                        "reply": f"OpenAI base URL: `{CFG.base_url}`\nSet with `/base-url <url>`.",
+                        "action": None}
+            norm = _normalize_openai_base(arg)
+            CFG.base_url = norm
+            update_env_file("OPENAI_BASE_URL", norm)
+            log_event("SYSTEM", f"slash /base-url -> {norm}")
+            probe = await _fetch_openai_models(base_url=norm)
+            if probe["error"] and not probe["models"]:
+                return {"handled": True,
+                        "reply": f"Base URL saved → `{norm}` (live now), "
+                                 f"but `/models` check failed: `{_short(probe['error'], 200)}`.",
+                        "action": None}
+            return {"handled": True,
+                    "reply": f"Base URL → `{norm}` (saved, live now) — "
+                             f"{len(probe['models'])} models reachable. See `/models openai`.",
+                    "action": None}
+
+        if cmd in ("/key", "/api-key", "/apikey", "/api_key"):
+            if not arg:
+                return {"handled": True,
+                        "reply": f"API key: `{_mask_key(CFG.api_key)}` "
+                                 f"(base `{CFG.base_url}`). Set with `/key <sk-...>`.",
+                        "action": None}
+            secret = arg.strip().strip('"').strip("'")
+            if len(secret) < 4:
+                return {"handled": True, "reply": "That key looks too short — nothing saved.",
+                        "action": None}
+            CFG.api_key = secret
+            update_env_file("OPENAI_API_KEY", secret)
+            log_event("SYSTEM", "slash /key -> updated (masked)")
+            return {"handled": True,
+                    "reply": f"API key saved (`{_mask_key(secret)}`, live now). "
+                             f"Verify with `/models openai`.",
+                    "action": None}
+
+        if cmd in ("/ollama-host", "/ollama_host", "/ollama"):
+            if not arg:
+                return {"handled": True,
+                        "reply": f"Ollama host: `{CFG.ollama_host}`\nSet with `/ollama-host <url>`.",
+                        "action": None}
+            norm = _normalize_ollama_host(arg)
+            CFG.ollama_host = norm
+            update_env_file("OLLAMA_HOST", norm)
+            log_event("SYSTEM", f"slash /ollama-host -> {norm}")
+            probe = await _fetch_ollama_models(host=norm)
+            if probe["error"] and not probe["models"]:
+                return {"handled": True,
+                        "reply": f"Ollama host saved → `{norm}` (live now), "
+                                 f"but check failed: `{_short(probe['error'], 180)}`.",
+                        "action": None}
+            return {"handled": True,
+                    "reply": f"Ollama host → `{norm}` (saved, live now) — "
+                             f"{len(probe['models'])} models reachable. See `/models ollama`.",
                     "action": None}
 
         if cmd == "/thinking":
@@ -1973,7 +2276,7 @@ async def handle_slash(text: str, ctx: dict) -> dict:
                         "reply": f"Reasoning effort: **{CFG.think_effort}** "
                                  f"(tokens {CFG.max_tokens}, up to {CFG.max_iterations} iters).\n"
                                  f"Set with `/thinking low|medium|high`.", "action": None}
-            lvl = arg.lower()
+            lvl = arg.lower().strip()
             if lvl not in ("low", "medium", "high"):
                 return {"handled": True, "reply": "Usage: `/thinking low|medium|high`.", "action": None}
             CFG.think_effort = lvl
@@ -1983,9 +2286,12 @@ async def handle_slash(text: str, ctx: dict) -> dict:
             return {"handled": True, "reply": f"Thinking effort → **{lvl}**{note}.", "action": None}
 
         if cmd == "/memory":
-            data = MEM.read("")
-            prof = data.get("profile", {})
-            facts = data.get("facts", [])
+            try:
+                data = MEM.read("")
+            except Exception as e:
+                return {"handled": True, "reply": f"Memory read failed: {e}", "action": None}
+            prof = data.get("profile", {}) or {}
+            facts = data.get("facts", []) or []
             if not prof and not facts:
                 return {"handled": True, "reply": "Memory is empty — I don't know you yet. Tell me your name!",
                         "action": None}
@@ -1998,9 +2304,13 @@ async def handle_slash(text: str, ctx: dict) -> dict:
             return {"handled": True, "reply": "What I remember:\n" + "\n".join(lines) + extra,
                     "action": None}
 
-        if cmd == "/help":
+        if cmd in ("/help", "/h", "/?"):
             lines = "\n".join(f"- `{c['usage']}` — {c['desc']}" for c in SLASH_COMMANDS)
-            return {"handled": True, "reply": "Commands:\n" + lines, "action": None}
+            cur_model = CFG.ollama_model if CFG.provider == "ollama" else CFG.model
+            return {"handled": True,
+                    "reply": (f"Commands (provider `{CFG.provider}`, model `{cur_model}`):\n"
+                              + lines),
+                    "action": None}
 
         if cmd == "/clear":
             return {"handled": True, "reply": "", "action": "clear"}
@@ -2061,10 +2371,13 @@ async def handle_slash(text: str, ctx: dict) -> dict:
             llm = LLMProvider()
             base_text = CFG.system_prompt_path.read_text(encoding="utf-8") \
                 if CFG.system_prompt_path.exists() else "You are NEXUS."
-            cycle = await evolution.evolve_once(
-                sm.root, repo, base_text, llm,
-                task_ref=f"slash:{sid[:8]}",
-                log_fn=lambda m: log_event("EVOLVE", str(m)[:200]))
+            try:
+                cycle = await evolution.evolve_once(
+                    sm.root, repo, base_text, llm,
+                    task_ref=f"slash:{(sid or '?')[:8]}",
+                    log_fn=lambda m: log_event("EVOLVE", str(m)[:200]))
+            except Exception as e:
+                return {"handled": True, "reply": f"Evolution cycle failed: {e}", "action": None}
             ap = cycle.get("applied", {})
             lines = [f"Evolution cycle done — prompt **{cycle.get('prompt_before')} → "
                      f"{cycle.get('prompt_after')}**",
@@ -2076,6 +2389,11 @@ async def handle_slash(text: str, ctx: dict) -> dict:
                     lines.append(f"- [{d['verdict']}] {str(d.get('text', ''))[:140]}")
             return {"handled": True, "reply": "\n".join(lines), "action": None}
 
+        if cmd.startswith("/"):
+            known = ", ".join(c["cmd"] for c in SLASH_COMMANDS)
+            return {"handled": True,
+                    "reply": f"Unknown command `{cmd}`. Try one of: {known}",
+                    "action": None}
         return {"handled": False, "reply": "", "action": None}
     except Exception as e:
         log_event("TUI", f"slash failed: {e}", level="ERROR")
@@ -2531,7 +2849,13 @@ class NexusTUI(App):
             if res.get("handled"):
                 action = res.get("action")
                 if action == "new":
-                    self._new_session()
+                    # handle_slash already created the session — attach to it,
+                    # don't create a second orphan session.
+                    if res.get("sid"):
+                        self._attach_session(res["sid"])
+                        self._log_system(f"New session: {res['sid']}")
+                    else:
+                        self._new_session()
                 elif action == "switch":
                     n = self._attach_session(res["sid"])
                     self._log_system(f"Opened {res['sid']} ({n} messages restored)")
@@ -2544,7 +2868,8 @@ class NexusTUI(App):
                 self._update_status()
                 self._tail_logs()
                 return
-            # unknown /command falls through to the agent as plain text
+            # not a slash command (shouldn't happen — unknown /cmd returns
+            # handled=True with a hint) — fall through to the agent
         log.write(Panel(Text(text, style="bold white"), title="You", border_style="violet"))
         log_event("TUI", f"user input sid={self.current_session} text={_short(text, 500)!r}")
         self._set_state("WORKING thinking…")

@@ -3,12 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NEXUS // JARVIS DECK</title>
-<link rel="stylesheet" href="/static/styles.css?v=9">
+<title>NEXUS // COMMAND DECK</title>
+<link rel="stylesheet" href="/static/styles.css?v=13">
 </head>
 <body>
 <header>
-  <span class="logo">&#11042; NEXUS</span><span class="sub">// JARVIS DECK</span>
+  <span class="logo">&#11042; NEXUS</span><span class="sub">// COMMAND DECK</span>
   <span class="sp"></span>
   <span id="hSession" class="dim">session —</span>
   <span id="hModel" class="dim">model —</span>
@@ -36,12 +36,14 @@
     <div class="panel"><h3>LOGS <span class="r">nexus.log</span></h3><div class="feed" id="logFeed"></div></div>
   </div>
   <div class="col" id="colC">
-    <div class="panel" id="corePanel"><h3>ENTITY <span class="r">electronic core · <span id="coreState">IDLE</span></span></h3><canvas id="coreCanvas" height="260"></canvas></div>
-    <div class="panel" id="termPanel"><h3>TERMINAL <span class="r"><button id="upBtn" title="Upload files to this session's workspace">📎 upload</button><input type="file" id="fileIn" multiple hidden></span></h3><div class="feed" id="termFeed"></div>
-      <div id="chatRow"><input id="chatIn" dir="auto" placeholder="order NEXUS…  / for commands (Enter to send)" autocomplete="off"><button id="sendBtn">SEND</button></div>
+    <div class="panel" id="corePanel"><h3>ENTITY <span class="r">hologram · <span id="coreState">IDLE</span></span></h3><div id="entityWrap"><canvas id="coreCanvas" height="260"></canvas></div><div class="dim" id="entityHint">drag to orbit · wheel to zoom · double-click resets</div></div>
+  </div>
+  <aside id="termStrip">
+    <div class="panel" id="termPanel"><h3>TERMINAL</h3><div id="chatGrip" title="drag to move · double-click to reset">···</div><div class="feed" id="termFeed"></div>
+      <div id="chatRow"><input id="chatIn" dir="auto" placeholder="order NEXUS…  / for commands (Enter to send)" autocomplete="off"><button id="sendBtn">SEND</button><button id="upBtn" title="Upload files to this session's workspace">📎</button><input type="file" id="fileIn" multiple hidden></div>
       <div id="slashHint"></div>
     </div>
-  </div>
+  </aside>
   <div class="col" id="colR">
     <div class="panel"><h3>AGENTS <span class="r" id="agCount"></span></h3><div id="agents"></div></div>
     <div class="panel"><h3>🧠 MEMORY <span class="r">long-term</span></h3><div id="memBox"><div class="dim">loading…</div></div></div>
@@ -52,6 +54,9 @@
   </div>
 </main>
 <div id="dropHint">Drop files to upload to this session's workspace</div>
-<script src="/static/app.js?v=9"></script>
+<div id="tabL" title="system panels">&#8250;</div>
+<div id="tabR" title="agent panels">&#8249;</div>
+<script src="/static/entity3d.js?v=15"></script>
+<script src="/static/app.js?v=13"></script>
 </body>
 </html>

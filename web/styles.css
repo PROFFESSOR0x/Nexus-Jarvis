@@ -19,10 +19,7 @@ body {
   background-image: radial-gradient(ellipse at 50% 30%, rgba(20, 90, 95, 0.25), transparent 70%);
 }
 header {
-  display: flex; align-items: center; gap: 14px;
-  padding: 8px 14px; border-bottom: 1px solid var(--line);
-  background: rgba(4, 14, 17, 0.95); height: 44px;
-  letter-spacing: 1px;
+  display: none;
 }
 header .logo { color: var(--acc); font-weight: bold; font-size: 15px; }
 header .sub { color: var(--dim); }
@@ -31,10 +28,58 @@ header .sp { flex: 1; }
 .dot.busy { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 #clock { color: var(--acc); }
 main {
-  display: grid; grid-template-columns: 300px 1fr 390px; gap: 8px;
-  padding: 8px; height: calc(100% - 44px);
+  display: grid; grid-template-columns: 1fr; gap: 0;
+  padding: 0; height: 100%;
 }
 .col { display: flex; flex-direction: column; gap: 8px; min-height: 0; overflow-y: auto; padding-right: 2px; }
+/* chat floats over the hologram: drag to move, corner to resize */
+#termStrip { position: fixed; left: 50%; transform: translateX(-50%); bottom: 10px;
+  width: min(560px, 94vw); z-index: 30;
+  resize: both; overflow: hidden;
+  min-width: 300px; max-width: 96vw; min-height: 150px; max-height: 92vh; }
+#termPanel { display: flex; flex-direction: column; min-height: 0; min-width: 0; position: relative;
+  width: 100%; height: 100%;
+  background: rgba(3, 12, 15, 0.72); border: 1px solid rgba(53, 240, 208, 0.22);
+  backdrop-filter: blur(6px); }
+#termFeed { flex: 1 1 auto; min-height: 60px; max-height: 30vh; overflow-y: auto; }
+#termStrip.sized #termFeed { max-height: none; }
+#chatGrip { height: 14px; flex: none; display: flex; align-items: center; justify-content: center;
+  cursor: grab; color: var(--dim); font-size: 10px; letter-spacing: 6px;
+  user-select: none; touch-action: none; }
+#chatGrip:active { cursor: grabbing; color: var(--acc); }
+#termStrip #chatRow { gap: 4px; }
+#termStrip #chatIn { min-width: 0; padding: 7px 5px; font-size: 11px; }
+#termStrip #sendBtn { padding: 7px 6px; font-size: 10px; }
+#termStrip #upBtn { padding: 1px 6px; font-size: 11px; }
+#termStrip #slashHint { left: 6px; right: 6px; }
+/* hologram fills its column */
+#colC { overflow: hidden; }
+#corePanel { flex: 1; display: flex; flex-direction: column; min-height: 0;
+  border: none; background: transparent; padding: 0; }
+#corePanel > h3, #termPanel > h3, #entityHint { display: none; }
+#entityWrap { flex: 1; min-height: 280px; }
+#coreCanvas { width: 100%; height: 100%; }
+/* side columns live in overlay drawers (screen stays empty for the hologram) */
+#colL, #colR {
+  position: fixed; top: 0; bottom: 0; z-index: 40;
+  overflow-y: auto; background: rgba(3, 12, 15, 0.96);
+  transition: transform .28s ease; padding: 8px 8px 24px 8px; margin: 0;
+}
+#colL { left: 0; width: 320px; transform: translateX(-106%);
+  box-shadow: 10px 0 34px rgba(0,0,0,.55); border-right: 1px solid var(--line); }
+#colR { right: 0; width: 400px; transform: translateX(106%);
+  box-shadow: -10px 0 34px rgba(0,0,0,.55); border-left: 1px solid var(--line); }
+body.showL #colL, body.peekL #colL { transform: none; }
+body.showR #colR, body.peekR #colR { transform: none; }
+#tabL, #tabR {
+  position: fixed; top: 50%; transform: translateY(-50%); z-index: 41;
+  width: 22px; height: 72px; display: flex; align-items: center; justify-content: center;
+  background: rgba(8, 28, 32, 0.92); border: 1px solid var(--line);
+  color: var(--acc); cursor: pointer; font-size: 15px; user-select: none;
+}
+#tabL { left: 0; border-left: none; border-radius: 0 7px 7px 0; }
+#tabR { right: 0; border-right: none; border-radius: 7px 0 0 7px; }
+#tabL:hover, #tabR:hover { background: rgba(53, 240, 208, 0.16); }
 .col::-webkit-scrollbar, .feed::-webkit-scrollbar { width: 6px; }
 .col::-webkit-scrollbar-thumb, .feed::-webkit-scrollbar-thumb { background: var(--line); }
 .panel {
@@ -58,7 +103,6 @@ table.procs { width: 100%; border-collapse: collapse; }
 table.procs td { padding: 1px 2px; }
 table.procs td:last-child, table.procs td:nth-child(2) { text-align: right; }
 #netCanvas { width: 100%; height: 64px; display: block; background: #03181c; }
-#coreCanvas { width: 100%; height: 240px; display: block; }
 .feed { overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
 #thinkFeed { min-height: 90px; max-height: 190px; }
 #radioFeed, #actFeed { max-height: 220px; min-height: 60px; }
@@ -86,8 +130,6 @@ pre code { color: var(--txt); }
 #termFeed .msg.nexus { border-color: var(--acc); }
 #termFeed .msg h4 { margin: 4px 0; color: var(--acc); }
 #termFeed .msg ul { margin: 4px 0; padding-left: 18px; }
-#termPanel { position: sticky; bottom: 0; background: rgba(8, 28, 32, 0.97); z-index: 4; flex: 1; display: flex; flex-direction: column; min-height: 340px; }
-#termFeed { flex: 1; min-height: 300px; max-height: none; }
 #chatRow { display: flex; gap: 6px; margin-top: 6px; background: inherit; }
 #slashHint {
   position: absolute; bottom: 48px; left: 10px; right: 10px; z-index: 6;
@@ -128,8 +170,40 @@ button:disabled { opacity: .4; cursor: default; }
 .agent.done-ok { border-color: var(--green); } .agent.done-fail { border-color: var(--red); }
 .agent.working { border-color: var(--amber); }
 .planline { padding-left: 8px; }
-#corePanel { position: relative; }
-#coreCanvas { width: 100%; height: 260px; display: block; }
+#entityHint { padding: 3px 2px 0 2px; font-size: 10px; }
+/* floating 3D labels: compact by default, full info on hover */
+#entityLabels { position: absolute; inset: 0; overflow: hidden; pointer-events: none; z-index: 3; }
+.e3-label { position: absolute; top: 0; left: 0; min-width: 0; max-width: 200px;
+  background: rgba(3, 14, 17, 0.72); border: 1px solid rgba(255,181,69,.45);
+  padding: 2px 7px; font-size: 10px; will-change: transform; white-space: nowrap; }
+.e3-label.leader { border-color: rgba(255,233,168,.8); box-shadow: 0 0 14px rgba(255,181,69,.25); }
+.e3-label.leader .e3-name b { font-size: 12px; }
+.e3-label.hot { background: rgba(3, 14, 17, 0.94); box-shadow: 0 0 18px rgba(255,181,69,.35); }
+.e3-label .e3-name { display: flex; align-items: center; gap: 5px; }
+.e3-label .e3-name i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; box-shadow: 0 0 6px currentColor; }
+.e3-label .e3-name b { color: #ffe9a8; letter-spacing: 1px; }
+.e3-label .e3-st { margin-left: auto; color: var(--dim); padding-left: 6px; }
+.e3-label .e3-sub, .e3-label .e3-chips { display: none; }
+.e3-label.hot .e3-sub { display: block; }
+.e3-label.hot .e3-chips { display: flex; }
+.e3-label .e3-sub { color: var(--dim); margin-top: 1px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.e3-label .e3-chips { margin-top: 2px; display: flex; flex-wrap: wrap; gap: 3px; }
+.e3-chip { border: 1px solid rgba(255,181,69,.5); color: #ffd88f; padding: 0 4px; font-size: 9px; }
+/* hover tooltip: rich agent card following the cursor */
+#entityTip { position: absolute; z-index: 5; pointer-events: none; display: none;
+  min-width: 170px; max-width: 250px; background: rgba(2, 14, 17, 0.94);
+  border: 1px solid rgba(255,233,168,.7); box-shadow: 0 0 22px rgba(255,181,69,.3);
+  padding: 6px 9px; font-size: 11px; }
+#entityTip h4 { margin: 0 0 3px 0; color: #ffe9a8; font-size: 13px; letter-spacing: 1px; }
+#entityTip .row { display: flex; justify-content: space-between; gap: 10px; margin: 2px 0; }
+#entityTip .k { color: var(--dim); }
+#entityTip .v { color: var(--txt); text-align: right; word-break: break-word; }
+#entityTip .tools { margin-top: 3px; display: flex; flex-wrap: wrap; gap: 3px; }
+/* HUD strip over the hologram */
+#entityHud { position: absolute; left: 8px; bottom: 6px; z-index: 4; display: flex; gap: 10px; align-items: baseline;
+  background: rgba(3, 12, 15, 0.65); padding: 2px 8px; border: 1px solid rgba(53,240,208,.25); }
+#entityHud .e3-hud-mode { color: #ffe9a8; font-size: 14px; letter-spacing: 2px; }
+#entityHud span { color: var(--dim); font-size: 10px; }
 #ioFeed { max-height: 320px; min-height: 90px; }
 #ioFeed .pop { margin-bottom: 6px; }
 .pop {
@@ -162,4 +236,4 @@ button:disabled { opacity: .4; cursor: default; }
 pre.json { margin: 2px 0 5px 0; }
 .json .jk { color: var(--amber); } .json .js { color: var(--green); }
 .json .jn { color: var(--acc); } .json .jb { color: #c9a6ff; }
-@media (max-width: 1100px) { main { grid-template-columns: 1fr; } body { overflow: auto; } .col { overflow: visible; } }
+@media (max-width: 1100px) { body { overflow: auto; } .col { overflow: visible; } #entityWrap { min-height: 320px; } }

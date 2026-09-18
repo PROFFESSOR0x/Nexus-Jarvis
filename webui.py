@@ -195,7 +195,7 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
 
     def state_snapshot() -> dict:
         csid = app.state.sid
-        # model/effort read live from CFG so /model /thinking reflect instantly
+        # model/effort read live from CFG so /model /thinking /provider reflect instantly
         model = CFG.ollama_model if CFG.provider == "ollama" else CFG.model
         try:
             meta = sm.load(csid)
@@ -208,6 +208,8 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
             "provider": CFG.provider,
             "model": model,
             "thinking": CFG.think_effort,
+            "base_url": CFG.base_url,
+            "ollama_host": CFG.ollama_host,
             "platform": f"{platform.system()} {platform.release()}",
             "uptime": round(time.time() - app.state.t0),
             "busy": app.state.lock.locked(),
@@ -260,7 +262,7 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
                         "messages": len(s.get("messages", [])),
                         "tool_calls": len(s.get("tool_calls", [])),
                         "updated": s.get("updated_at")})
-        return {"sessions": out, "active": sid}
+        return {"sessions": out, "active": app.state.sid}
 
     @app.get("/api/memory")
     async def api_memory():
@@ -274,6 +276,28 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
     @app.get("/api/commands")
     async def api_commands():
         return {"commands": nexus.SLASH_COMMANDS}
+
+    @app.get("/api/models")
+    async def api_models():
+        """Live model lists for both providers (for dropdowns / /models UI).
+
+        Never raises 500 for a down provider — returns per-provider error
+        strings so the UI can show diagnostics.
+        """
+        import asyncio as _aio
+        oll_c, oai_c = await _aio.gather(
+            nexus._fetch_ollama_models(),
+            nexus._fetch_openai_models(),
+        )
+        cur = CFG.ollama_model if CFG.provider == "ollama" else CFG.model
+        return {
+            "provider": CFG.provider,
+            "current": cur,
+            "ollama": {"host": oll_c.get("host"), "models": oll_c.get("models", []),
+                       "error": oll_c.get("error")},
+            "openai": {"base_url": oai_c.get("base_url"), "models": oai_c.get("models", []),
+                       "error": oai_c.get("error"), "status": oai_c.get("status")},
+        }
 
     @app.post("/api/upload")
     async def api_upload(files: List[UploadFile] = File(...)):
@@ -349,7 +373,13 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
             res = await nexus.handle_slash(msg, {"sm": sm, "sid": sid})
             action = res.get("action")
             if action == "new":
-                sid = sm.create("web")
+                # handle_slash already created the session — attach to it
+                # (creating a second one here orphaned an empty session).
+                nsid = res.get("sid")
+                if nsid:
+                    sid = nsid
+                else:
+                    sid = sm.create("web")
                 agent = make_agent(sid)
                 app.state.sid, app.state.agent = sid, agent
                 hub.listener("session", {"sid": sid})
@@ -360,7 +390,10 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
                 app.state.sid, app.state.agent = sid, agent
                 hub.listener("session", {"sid": sid, "restored": n})
                 res["reply"] = (res.get("reply") or "") + f"\n({n} messages restored)"
-            return {"final": res.get("reply") or "(done)", "slash": True}
+            elif action == "clear":
+                return {"final": res.get("reply") or "", "slash": True, "action": "clear"}
+            return {"final": res.get("reply") or "(done)", "slash": True,
+                    "action": action}
         if app.state.lock.locked():
             raise HTTPException(409, "agent is busy with another turn")
         async with app.state.lock:
