@@ -103,22 +103,23 @@ function hashStr(s) {
    light pillar while running, spin=extra gyro kick 0..1, halo=colored shell
    tint while the call is in flight. */
 var TOOL_FX = {
-  "exec.shell":     { color: "#35f0d0", rgb: "53,240,208",   glyph: "$", burst: 46, ring: true,  beam: false, spin: 0.55, halo: true  },
-  "exec.code":      { color: "#b48cff", rgb: "180,140,255",  glyph: "#", burst: 60, ring: true,  beam: true,  spin: 0.80, halo: true  },
-  "web.search":     { color: "#5aa9ff", rgb: "90,169,255",   glyph: "?", burst: 34, ring: true,  beam: false, spin: 0.45, halo: false },
-  "web.fetch":      { color: "#c86bff", rgb: "200,107,255",  glyph: "~", burst: 40, ring: true,  beam: true,  spin: 0.60, halo: true  },
-  "parallel":       { color: "#ffd24a", rgb: "255,210,74",   glyph: "=", burst: 90, ring: true,  beam: true,  spin: 1.00, halo: true  },
-  "agent.delegate": { color: "#ff9a3c", rgb: "255,154,60",   glyph: "@", burst: 80, ring: true,  beam: true,  spin: 0.90, halo: true  },
-  "agent.say":      { color: "#ffb454", rgb: "255,180,84",   glyph: "\u00bb", burst: 16, ring: false, beam: false, spin: 0.25, halo: false },
-  "agent.plan":     { color: "#3dffa2", rgb: "61,255,162",   glyph: "\u2713", burst: 26, ring: true,  beam: false, spin: 0.40, halo: false },
-  "memory.read":    { color: "#35f0d0", rgb: "53,240,208",   glyph: "R", burst: 20, ring: false, beam: false, spin: 0.30, halo: false },
-  "memory.remember":{ color: "#ffd24a", rgb: "255,210,74",   glyph: "W", burst: 44, ring: true,  beam: false, spin: 0.50, halo: true  },
-  "memory.forget":  { color: "#ff5d5d", rgb: "255,93,93",    glyph: "X", burst: 40, ring: true,  beam: false, spin: 0.50, halo: true  },
-  "memory.profile": { color: "#ff7ad9", rgb: "255,122,217",  glyph: "P", burst: 30, ring: true,  beam: false, spin: 0.40, halo: true  }
+  "exec.shell":     { color: "#35f0d0", rgb: "53,240,208",   glyph: "$", burst: 46, ring: true,  beam: false, spin: 0.55, halo: true, theme: "#35f0d0", spinMul: 1.10, bobMul: 1.00, ringMul: 1.30 },
+  "exec.code":      { color: "#b48cff", rgb: "180,140,255",  glyph: "#", burst: 60, ring: true,  beam: true,  spin: 0.80, halo: true, theme: "#b48cff", spinMul: 1.60, bobMul: 1.10, ringMul: 1.60 },
+  "web.search":     { color: "#5aa9ff", rgb: "90,169,255",   glyph: "?", burst: 34, ring: true,  beam: false, spin: 0.45, halo: false, theme: "#5aa9ff", spinMul: 0.90, bobMul: 1.30, ringMul: 1.10 },
+  "web.fetch":      { color: "#c86bff", rgb: "200,107,255",  glyph: "~", burst: 40, ring: true,  beam: true,  spin: 0.60, halo: true, theme: "#c86bff", spinMul: 1.20, bobMul: 0.80, ringMul: 1.40 },
+  "parallel":       { color: "#ffd24a", rgb: "255,210,74",   glyph: "=", burst: 90, ring: true,  beam: true,  spin: 1.00, halo: true, theme: "#ffd24a", spinMul: 1.80, bobMul: 1.20, ringMul: 1.80 },
+  "agent.delegate": { color: "#ff9a3c", rgb: "255,154,60",   glyph: "@", burst: 80, ring: true,  beam: true,  spin: 0.90, halo: true, theme: "#ff9a3c", spinMul: 1.30, bobMul: 1.10, ringMul: 1.50 },
+  "agent.say":      { color: "#ffb454", rgb: "255,180,84",   glyph: "\u00bb", burst: 16, ring: false, beam: false, spin: 0.25, halo: false, theme: "#ffb454", spinMul: 1.00, bobMul: 1.40, ringMul: 1.00 },
+  "agent.plan":     { color: "#3dffa2", rgb: "61,255,162",   glyph: "\u2713", burst: 26, ring: true,  beam: false, spin: 0.40, halo: false, theme: "#3dffa2", spinMul: 0.80, bobMul: 1.10, ringMul: 0.90 },
+  "memory.read":    { color: "#35f0d0", rgb: "53,240,208",   glyph: "R", burst: 20, ring: false, beam: false, spin: 0.30, halo: false, theme: "#35f0d0", spinMul: 0.70, bobMul: 1.20, ringMul: 0.80 },
+  "memory.remember":{ color: "#ffd24a", rgb: "255,210,74",   glyph: "W", burst: 44, ring: true,  beam: false, spin: 0.50, halo: true, theme: "#ffe9a8", spinMul: 0.60, bobMul: 1.40, ringMul: 0.70 },
+  "memory.forget":  { color: "#ff5d5d", rgb: "255,93,93",    glyph: "X", burst: 40, ring: true,  beam: false, spin: 0.50, halo: true, theme: "#ff5d5d", spinMul: 1.40, bobMul: 0.70, ringMul: 1.50 },
+  "memory.profile": { color: "#ff7ad9", rgb: "255,122,217",  glyph: "P", burst: 30, ring: true,  beam: false, spin: 0.40, halo: true, theme: "#ff7ad9", spinMul: 0.90, bobMul: 1.10, ringMul: 1.00 }
 };
 function toolFx(name) {
   return TOOL_FX[name] || { color: "#ffe9a8", rgb: GOLD_RGB, glyph: "\u2022",
-    burst: 24, ring: false, beam: false, spin: 0.35, halo: false };
+    burst: 24, ring: false, beam: false, spin: 0.35, halo: false,
+    theme: "#ffe9a8", spinMul: 1.15, bobMul: 1, ringMul: 1.2 };
 }
 
 /* ================================ 1. UTILS =============================== */
@@ -385,6 +386,7 @@ var E = {
     layoutOrbits();
     w.orbiters.length = 0;
     w.halo = null;
+    w.themeStack = []; tintDialOf(w);
     addRing("leader", ok ? "#3dffa2" : "#ff5d5d", 0.9);
     var old = S.order.filter(function (k) { return S.workers[k] && S.workers[k].retired; });
     if (old.length > 12) {
@@ -419,6 +421,7 @@ var E = {
     if (S.leader) {
       S.leader.orbiters.length = 0; S.leader.flash = 0;
       S.leader.think = 0; S.leader.spinKick = 0; S.leader.halo = null;
+      S.leader.themeStack = []; tintDialOf(S.leader);
       S.leader.lastAction = "";
     }
     S.hud.tools = 0;
@@ -500,6 +503,7 @@ var E = {
     w.spinKick = Math.min(1.5, w.spinKick + fx.spin);
     w.flash = Math.max(w.flash, 0.45); w.flashColor = fx.color;
     if (fx.halo) w.halo = { color: fx.color };
+    pushTheme(w, tool);
     if (fx.beam) S.beams.push({ at: w.id, color: fx.color, t: 0, ttl: 2.6 });
     addBurst(w.id, fx.color, fx.burst);
     if (tool === "agent.say" && w.id !== "leader")
@@ -518,6 +522,7 @@ var E = {
       if (!w.orbiters.length) w.halo = null;
       w.lastAction = tool + " " + (+elapsed || 0).toFixed(1) + "s";
       w.flash = Math.max(w.flash, 0.6);
+      popTheme(w, tool);
       w.flashColor = ok ? "#3dffa2" : "#ff5d5d";
     }
     if (S.engine === "three") T3.lightPing(owner, ok ? "#3dffa2" : "#ff5d5d", 65);
@@ -570,6 +575,76 @@ function smoothChannels(dt) {
   S.workT = (S.workT || 0) * Math.pow(0.4, dt);
   var dw = (S.workT || 0) - S.work;
   S.work = clamp(S.work + clamp(dw, -0.5 * dt, 1.4 * dt), 0, 1.3);
+}
+/* thinking mode: light violet, slow majestic drift, deep breathing */
+var THINK_FX = { color: "#c9a6ff", theme: "#c9a6ff",
+  spinMul: 0.55, bobMul: 1.6, ringMul: 0.6 };
+/* theme stack per entity: newest running tool/state owns the whole look */
+function pushTheme(w, key) {
+  if (!w) return;
+  w.themeStack = w.themeStack || [];
+  var fx = (key === "thinking") ? THINK_FX : toolFx(key);
+  w.themeStack.push({ key: key, fx: fx });
+  tintDialOf(w);
+}
+function popTheme(w, key) {
+  if (!w || !w.themeStack) return;
+  for (var i = w.themeStack.length - 1; i >= 0; i--) {
+    if (w.themeStack[i].key === key) { w.themeStack.splice(i, 1); break; }
+  }
+  tintDialOf(w);
+}
+function themeOf(w) {
+  if (!w || !w.themeStack || !w.themeStack.length) return null;
+  var top = w.themeStack[w.themeStack.length - 1];
+  return { color: top.fx.theme || top.fx.color,
+    spinMul: top.fx.spinMul || 1, bobMul: top.fx.bobMul || 1,
+    ringMul: top.fx.ringMul || 1 };
+}
+/* dial ticks re-tint on theme change (rare: only on push/pop) */
+function tintDialOf(w) {
+  if (!w || !w.node || !w.node.dial || !T3.THREE) return;
+  if (S.engine !== "three") return;
+  var thm = themeOf(w);
+  var THREE = T3.THREE;
+  var cGold = new THREE.Color(GOLD.mid), cHot = new THREE.Color(GOLD.hot),
+      cDim = new THREE.Color(GOLD.dim);
+  var tc = thm ? new THREE.Color(thm.color) : null;
+  var n = w.node.dial.count || 72;
+  for (var di = 0; di < n; di++) {
+    var base = (di % 6 === 0 ? cHot : (di % 2 ? cGold : cDim)).clone();
+    if (tc) base.lerp(tc, 0.65);
+    w.node.dial.setColorAt(di, base);
+  }
+  if (w.node.dial.instanceColor) w.node.dial.instanceColor.needsUpdate = true;
+}
+/* glide every tintable material toward the active theme (smooth, per frame) */
+function applyThemeColors(w, n, dt) {
+  if (!T3.tmpCol || !T3.tmpCol2) return;
+  var thm = themeOf(w);
+  var rate = 1 - Math.pow(0.02, dt);
+  var C = T3.tmpCol, D = T3.tmpCol2;
+  function glide(mat, base, amt) {
+    if (!mat || !mat.color) return;
+    C.set(base);
+    if (thm) { D.set(thm.color); C.lerp(D, amt == null ? 0.7 : amt); }
+    mat.color.lerp(C, rate);
+  }
+  glide(n.coreMat, GOLD.core);
+  glide(n.kernelMat, "#ffffff", 0.5);
+  glide(n.glow.material, GOLD.mid, 0.8);
+  glide(n.atmoMat, GOLD.mid, 0.8);
+  glide(n.shellMat, GOLD.mid, 0.75);
+  if (n.outer) glide(n.outer.material, GOLD.dim, 0.7);
+  if (thm && n.emberMat) { D.set(thm.color); n.emberMat.color.lerp(D, rate * 0.65); }
+  glide(n.dustMat, "#ffffff", 0.6);
+  glide(n.moteMat, GOLD.hot, 0.7);
+  if (S.leader === w && T3.floorGlow) glide(T3.floorGlow.material, GOLD.mid, 0.35);
+  for (var i = 0; n.rings && i < n.rings.length; i++) {
+    var rgm = n.rings[i];
+    if (rgm.userData.keep || rgm.userData.baseHex == null) continue;
+    glide(rgm.material, rgm.userData.baseHex, 0.7);
+  }
 }
 function trimPulses() {
   if (S.pulses.length > 80) S.pulses.splice(0, S.pulses.length - 80);
@@ -640,7 +715,7 @@ var T3 = {
   reconTick: 0, camDist: 10.6,
   ndcX: 0, ndcY: 0, px: 0, py: 0, // pointer for parallax + hover raycast
   raycaster: null, hoverTick: 0, look: null,
-  calmCol: null, hotCol: null, tmpCol: null,
+  calmCol: null, hotCol: null, tmpCol: null, tmpCol2: null,
   tetherTips: {},   // workerId -> [tipA, tipB] endpoint glow sprites
   time: 0
 };
@@ -719,6 +794,7 @@ T3.init = function (THREE) {
   T3.calmCol = new THREE.Color("#a8843f");
   T3.hotCol = new THREE.Color("#ffffff");
   T3.tmpCol = new THREE.Color("#ffffff");
+  T3.tmpCol2 = new THREE.Color("#ffffff");
   T3.root = new THREE.Group();
   T3.scene.add(T3.root);
 
@@ -944,6 +1020,7 @@ T3.buildEntityNode = function (w, R, emberN, moteN) {
     rg.rotation.set(tilts[i].x, tilts[i].y, tilts[i].z);
     rg.userData.sp = tilts[i].sp;
     rg.userData.baseOp = i === 0 ? 0.55 : 0.38;
+    rg.userData.baseHex = i === 0 ? GOLD.hot : GOLD.mid;
     group.add(rg);
     node.rings.push(rg);
   }
@@ -956,6 +1033,7 @@ T3.buildEntityNode = function (w, R, emberN, moteN) {
         blending: THREE.AdditiveBlending, depthWrite: false }));
     acc.rotation.set(Math.PI / 2.4, 0.3, 0);
     acc.userData.sp = 1.1;
+    acc.userData.keep = true; // identity tint never themed
     group.add(acc);
     node.rings.push(acc);
   }
@@ -983,6 +1061,7 @@ T3.buildEntityNode = function (w, R, emberN, moteN) {
     arc.rotation.set(ad.tilt[0], ad.tilt[1], ad.tilt[2]);
     arc.userData.sp = ad.sp;
     arc.userData.baseOp = ai === 0 ? 0.6 : 0.45;
+    arc.userData.baseHex = ai === 0 ? GOLD.hot : GOLD.mid;
     group.add(arc);
     node.rings.push(arc);
     /* free tip light: its OWN private orbit, never slaved to the arc.
@@ -1077,6 +1156,7 @@ T3.buildEntityNode = function (w, R, emberN, moteN) {
       vertexColors: true, transparent: true, opacity: 0.85,
       depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true });
     node.dust = new THREE.Points(g, m);
+    node.dustMat = m;
     group.add(node.dust);
   })();
 
@@ -1122,6 +1202,7 @@ T3.buildEntityNode = function (w, R, emberN, moteN) {
       color: new THREE.Color(GOLD.hot), transparent: true, opacity: 0.9,
       depthWrite: false, blending: THREE.AdditiveBlending });
     node.motePts = new THREE.Points(g, m);
+    node.moteMat = m;
     node.moteDat = dat;
     group.add(node.motePts);
   })();
@@ -1304,11 +1385,18 @@ T3.animEntity = function (w, dt, t, boost) {
   var drive = 1 + S.work * 3.2;
   var flick = (S.flick == null ? 1 : S.flick);
   var wt = S.wanderT; // old ambient motions read this clock, so they speed up with work
+  /* thinking owns a mode while it burns (hysteresis: no flicker at the edge) */
+  if (w.think > 0.4 && !w._thinkThemed) { w._thinkThemed = true; pushTheme(w, "thinking"); }
+  else if (w._thinkThemed && w.think < 0.12) { w._thinkThemed = false; popTheme(w, "thinking"); }
+  var thm0 = themeOf(w);
+  var spinMul = thm0 ? (thm0.spinMul || 1) : 1;
+  var ringMul = thm0 ? (thm0.ringMul || 1) : 1;
+  var bobMul = thm0 ? (thm0.bobMul || 1) : 1;
   /* retired agents: slow drift (pace) + dimmed light (dimF), still alive */
   var pace = w.retired ? 0.25 : 1;
   var dimF = w.retired ? 0.5 : 1;
   drive *= pace;
-  var spin = (0.35 + w.spinKick * 1.6 + excite * 0.9 + (w.flare || 0) * 0.8) * boost * drive;
+  var spin = (0.35 + w.spinKick * 1.6 + excite * 0.9 + (w.flare || 0) * 0.8) * boost * drive * spinMul;
 
   /* ---- lifespan scale: birth pop-in / 6s retire fade ---- */
   var sAlive = 1;
@@ -1319,7 +1407,7 @@ T3.animEntity = function (w, dt, t, boost) {
     sAlive = clamp(n.group.scale.x + dt * 2.2, 0.01, 1);
   }
   /* breathing (the hologram is alive) */
-  var breath = 1 + Math.sin(wt * 1.7 + w.phase) * 0.018 + excite * 0.012;
+  var breath = 1 + Math.sin(wt * 1.7 + w.phase) * 0.018 * bobMul + excite * 0.012;
   n.group.scale.set(sAlive * breath, sAlive * breath, sAlive * breath);
 
   /* ---- free motion ---- */
@@ -1333,9 +1421,9 @@ T3.animEntity = function (w, dt, t, boost) {
     var sya = parked ? 0.5 : (w._slot ? w._slot.yAmp : 1.0);
     var stf = parked ? 0.9 : (w._slot ? w._slot.tiltF : 0.9);
     var yb2 = parked ? w._park.y : lp.y;
-    var wob = Math.sin(wt * 0.5 + w.phase) * 0.22;
+    var wob = Math.sin(wt * 0.5 + w.phase) * 0.22 * bobMul;
     var tx = lp.x + Math.cos(w._orbA || 0) * srr + Math.sin(wt * 0.43 + w.phase) * 0.18;
-    var ty = yb2 + Math.sin((w._orbA || 0) * stf) * sya + Math.sin(wt * 0.9 + w.phase) * 0.16;
+    var ty = yb2 + Math.sin((w._orbA || 0) * stf) * sya + Math.sin(wt * 0.9 + w.phase) * 0.16 * bobMul;
     var tz = lp.z + Math.sin(w._orbA || 0) * srr * 0.55 - 0.5 + wob * 0.4;
     var k = 1 - Math.pow(0.001, dt);
     gp.x = lerp(gp.x, tx, k);
@@ -1344,7 +1432,7 @@ T3.animEntity = function (w, dt, t, boost) {
   } else {
     /* leader wanders the center stage (lissajous drift, always near middle) */
     gp.x = Math.sin(wt * 0.21) * 0.42 + Math.sin(wt * 0.083 + 1.7) * 0.18;
-    gp.y = 0.15 + Math.sin(wt * 0.33 + w.phase) * 0.22 + Math.sin(wt * 0.9) * 0.03;
+    gp.y = 0.15 + Math.sin(wt * 0.33 + w.phase) * 0.22 * bobMul + Math.sin(wt * 0.9) * 0.03 * bobMul;
     gp.z = Math.cos(wt * 0.17) * 0.32;
   }
 
@@ -1378,8 +1466,8 @@ T3.animEntity = function (w, dt, t, boost) {
      (deeper + faster while work runs) so strips grow/shrink live */
   for (var i = 0; i < n.rings.length; i++) {
     var rg = n.rings[i];
-    rg.rotation.z += dt * (rg.userData.sp || 0.3) * (1 + excite * 1.6 + w.spinKick) * drive;
-    rg.rotation.x += dt * 0.05 * (i % 2 ? 1 : -1) * drive;
+    rg.rotation.z += dt * (rg.userData.sp || 0.3) * (1 + excite * 1.6 + w.spinKick) * drive * ringMul;
+    rg.rotation.x += dt * 0.05 * (i % 2 ? 1 : -1) * drive * ringMul;
     var br = 1 + Math.sin(wt * (0.7 + (i % 3) * 0.35) + w.phase + i * 1.7) *
       (0.035 + S.work * 0.035);
     rg.scale.set(br, br, br);
@@ -1425,7 +1513,7 @@ T3.animEntity = function (w, dt, t, boost) {
   }
   /* measurement dial ticks forward (accelerates with work) */
   if (n.dial) {
-    n.dial.rotation.y += dt * (0.22 + excite * 0.5 + w.spinKick * 0.8) * drive;
+    n.dial.rotation.y += dt * (0.22 + excite * 0.5 + w.spinKick * 0.8) * drive * ringMul;
     n.dial.material.opacity = 0.85 * flick * dimF;
   }
   /* free tip lights drift on fully private orbits — decoupled from arcs */
@@ -1457,6 +1545,8 @@ T3.animEntity = function (w, dt, t, boost) {
     }
     n.motePts.geometry.attributes.position.needsUpdate = true;
   }
+  /* whole-entity theme glide (colors chase the active mode) */
+  applyThemeColors(w, n, dt);
 
   /* permanent power aura breathes with work */
   if (n.aura) {
