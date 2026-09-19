@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NEXUS // COMMAND DECK</title>
-<link rel="stylesheet" href="/static/styles.css?v=13">
+<link rel="stylesheet" href="/static/styles.css?v=19">
 </head>
 <body>
 <header>
@@ -40,7 +40,7 @@
   </div>
   <aside id="termStrip">
     <div class="panel" id="termPanel"><h3>TERMINAL</h3><div id="chatGrip" title="drag to move · double-click to reset">···</div><div class="feed" id="termFeed"></div>
-      <div id="chatRow"><input id="chatIn" dir="auto" placeholder="order NEXUS…  / for commands (Enter to send)" autocomplete="off"><button id="sendBtn">SEND</button><button id="upBtn" title="Upload files to this session's workspace">📎</button><input type="file" id="fileIn" multiple hidden></div>
+      <div id="chatRow"><input id="chatIn" dir="auto" placeholder="order NEXUS…  / for commands (Enter to send)" autocomplete="off"><button id="sendBtn">SEND</button><button id="nestBtn" title="NEST MODE OFF — enable worker-spawned sub-workers">NEST</button><button id="upBtn" title="Upload files to this session's workspace">📎</button><input type="file" id="fileIn" multiple hidden></div>
       <div id="slashHint"></div>
     </div>
   </aside>
@@ -54,9 +54,10 @@
   </div>
 </main>
 <div id="dropHint">Drop files to upload to this session's workspace</div>
+<div id="newChatBtn" title="open another NEXUS chat (parallel session)">+ Chat</div>
 <div id="tabL" title="system panels">&#8250;</div>
 <div id="tabR" title="agent panels">&#8249;</div>
-<script src="/static/entity3d.js?v=16"></script>
-<script src="/static/app.js?v=13"></script>
+<script src="/static/entity3d.js?v=37"></script>
+<script src="/static/app.js?v=23"></script>
 </body>
 </html>

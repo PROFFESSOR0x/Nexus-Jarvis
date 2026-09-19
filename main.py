@@ -43,6 +43,21 @@ from textual.theme import Theme
 from textual.binding import Binding
 from textual.message import Message
 
+# NEXUS browser tool (full Playwright). Import is lightweight: playwright
+# itself is imported lazily inside nexus_browser on first browser action.
+try:
+    from nexus_browser import tool_browser, TOOL_SPEC_BROWSER
+except Exception as _e:  # pragma: no cover - missing file should not kill NEXUS
+    async def tool_browser(action: str = "", **kw) -> dict:  # type: ignore
+        return {"success": False, "action": action or "?",
+                "error": f"browser tool unavailable (nexus_browser import failed: {_e})"}
+    TOOL_SPEC_BROWSER = {  # type: ignore
+        "type": "function",
+        "function": {"name": "browser",
+                     "description": "UNAVAILABLE (nexus_browser failed to import).",
+                     "parameters": {"type": "object", "properties": {}}},
+    }
+
 # ── Load environment ──
 load_dotenv()
 
@@ -193,8 +208,15 @@ class Config:
     max_iterations: int = int(os.getenv("MAX_ITERATIONS", "100"))
     think_effort: str = os.getenv("THINK_EFFORT", "medium").strip().lower() or "medium"
     max_subagents: int = int(os.getenv("MAX_SUBAGENTS", "100"))
+    recursive_max_depth: int = int(os.getenv("RECURSIVE_MAX_DEPTH", "3"))
+    recursive_max_tasks: int = int(os.getenv("RECURSIVE_MAX_TASKS", "10"))
+    recursive_max_tree: int = int(os.getenv("RECURSIVE_MAX_TREE", "100"))
+    recursive_tree_ceiling: int = int(os.getenv("RECURSIVE_TREE_CEILING", "600"))
     subagent_max_iterations: int = int(os.getenv("SUBAGENT_MAX_ITERATIONS", "100"))
     delegate_max_rounds: int = int(os.getenv("DELEGATE_MAX_ROUNDS", "100"))
+    round_quiet_sec: float = float(os.getenv("ROUND_QUIET_SEC", "8"))
+    round_timeout_sec: float = float(os.getenv("ROUND_TIMEOUT_SEC", "600"))
+    worker_linger_sec: float = float(os.getenv("WORKER_LINGER_SEC", "240"))
     workspace_root: Path = Path(os.getenv("WORKSPACE_ROOT", Path.home() / ".nexus" / "sessions"))
     system_prompt_path: Path = Path(os.getenv("SYSTEM_PROMPT", Path(__file__).parent / "system_prompt.txt"))
     memory_path: Path = Path(os.getenv("MEMORY_PATH", Path.home() / ".nexus" / "memory.json"))
@@ -208,6 +230,18 @@ class Config:
         self.ollama_host = fixed
         if self.think_effort not in ("low", "medium", "high"):
             self.think_effort = "medium"
+        # Log-found fix: .env had LLM_MAX_TOKENS=10000000 — Ollama cloud
+        # rejects anything over the model's max (65536) and every turn
+        # failed/retried. Clamp so a bad env can't wedge the interface.
+        try:
+            if self.max_tokens > 65536:
+                log_event("SYSTEM", f"LLM_MAX_TOKENS clamped {self.max_tokens} -> 65536 "
+                                    f"(cloud max)", level="WARNING")
+                self.max_tokens = 65536
+            elif self.max_tokens < 256:
+                self.max_tokens = 256
+        except Exception:
+            pass
 
     @property
     def ollama_think(self):
@@ -537,8 +571,9 @@ async def tool_exec_shell(command: str, shell_type: Optional[str] = None,
         proc = await asyncio.create_subprocess_exec(
             executable, "-c" if executable.endswith(("bash", "sh", "zsh")) else "/c",
             command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.DEVNULL,  # log-found fix: commands waiting
+            stdout=asyncio.subprocess.PIPE,    # on stdin (bare `grep`, `cat`)
+            stderr=asyncio.subprocess.PIPE,    # used to hang until timeout
             cwd=cwd or str(Path.cwd()),
         )
         try:
@@ -626,7 +661,8 @@ async def tool_exec_code(code: str, language: str = "python",
             return {"success": False, "error": f"Unsupported language: {language}"}
 
         proc = await asyncio.create_subprocess_exec(
-            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            *cmd, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
             cwd=str(workdir))
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -660,11 +696,17 @@ async def tool_web_search(queries: List[str], max_results: int = 8,
     async def _one(q: str):
         loop = asyncio.get_event_loop()
         try:
-            results = await loop.run_in_executor(
+            # Log-found fix: ddgs has no internal timeout — a dead backend
+            # (refused startpage, hanging DDG) stalled workers until the round
+            # died. Fail fast so workers move on instead of burning iterations.
+            results = await asyncio.wait_for(loop.run_in_executor(
                 None,
                 lambda: list(DDGS().text(q, max_results=max_results, region=region, safesearch=safesearch))
-            )
+            ), timeout=25)
             return {"query": q, "results": results}
+        except asyncio.TimeoutError:
+            return {"query": q, "error": "search backend timed out after 25s "
+                    "(no route to DDG/startpage?) — try fewer queries or web.fetch a direct URL"}
         except Exception as e:
             return {"query": q, "error": str(e)}
 
@@ -716,9 +758,65 @@ async def tool_web_fetch(url: str, fmt: str = "markdown", timeout: int = 30) -> 
                 content += "\n\n/* Linked stylesheets: " + ", ".join(links) + " */"
         else:
             content = raw
+        if resp.status_code >= 400:
+            return {"success": False, "url": url,
+                    "error": f"HTTP {resp.status_code} for {url}",
+                    "meta": meta}
         return {"success": True, "url": url, "format": fmt, "meta": meta, "content": content}
     except Exception as e:
-        return {"success": False, "url": url, "error": str(e)}
+        # Log-found fix: httpx timeouts often stringify to "" — include the
+        # exception class so logs/UI show *what* failed instead of blank.
+        msg = f"{type(e).__name__}: {e}".strip()
+        if not msg or msg.endswith(":"):
+            msg = f"{type(e).__name__} (no detail — likely timeout after {timeout}s for {url})"
+        return {"success": False, "url": url, "error": msg}
+
+
+APP_ROOT = Path(__file__).parent.resolve()  # the running NEXUS runtime (code+web UI)
+
+
+def _is_runtime_path(p) -> bool:
+    """True when path p resolves inside the NEXUS runtime tree."""
+    try:
+        return Path(str(p)).expanduser().resolve().is_relative_to(APP_ROOT)
+    except Exception:
+        return False
+
+
+def _runtime_ref_scan(text: str):
+    """Best-effort scan of shell/code text for runtime-scope references.
+    Returns the matched path token, or None. Covers absolute APP_ROOT,
+    ~-expanded, and bare-repo-dirname tokens (e.g. `cd Nexus-Jarvis`)."""
+    if not text:
+        return None
+    s = str(text)
+    root = str(APP_ROOT)
+    if root in s:
+        return root
+    try:
+        home_root = str(Path("~").expanduser() / APP_ROOT.name)
+        if home_root in s or ("~/" + APP_ROOT.name) in s:
+            return "~/" + APP_ROOT.name
+    except Exception:
+        pass
+    import re as _re2
+    m = _re2.search(r"(^|[\s '\";=]|\./)(" + _re2.escape(APP_ROOT.name) + r")(/|\s|$)", s)
+    if m:
+        return m.group(2) + m.group(3).strip() or m.group(2)
+    return None
+
+
+def _runtime_touched(name: str, params: dict):
+    """Which runtime path (if any) does this call target? None = clear."""
+    params = params or {}
+    if name == "exec.shell":
+        cwd = params.get("cwd")
+        if cwd and _is_runtime_path(cwd):
+            return str(cwd)
+        return _runtime_ref_scan(params.get("command", ""))
+    if name == "exec.code":
+        return _runtime_ref_scan(params.get("code", ""))
+    return None
 
 
 # ============================================================
@@ -729,6 +827,7 @@ TOOL_REGISTRY: Dict[str, Callable[..., Awaitable[dict]]] = {
     "exec.code": tool_exec_code,
     "web.search": tool_web_search,
     "web.fetch": tool_web_fetch,
+    "browser": tool_browser,
     "memory.read": tool_memory_read,
     "memory.remember": tool_memory_remember,
     "memory.forget": tool_memory_forget,
@@ -736,22 +835,68 @@ TOOL_REGISTRY: Dict[str, Callable[..., Awaitable[dict]]] = {
 }
 
 
-async def execute_tool(name: str, params: dict, session_workspace: str = None) -> dict:
-    """Execute a single tool by name."""
+async def execute_tool(name: str, params: dict, session_workspace: str = None,
+                   allow_code_edit: bool = False, actor: str = "leader") -> dict:
+    """Execute a single tool by name. allow_code_edit/actor are TRUSTED
+    (caller-side): any model-supplied copies in params are stripped."""
+    params = dict(params or {})
+    params.pop("allow_code_edit", None)
+    params.pop("actor", None)
+    if name in ("exec.shell", "exec.code") and not allow_code_edit:
+        hit = _runtime_touched(name, params)
+        if hit:
+            log_event("TOOL", f"runtime code-edit DENIED actor={actor} tool={name} ref={hit!r}",
+                      level="WARNING")
+            return {"success": False,
+                    "error": f"runtime code-edit denied: {hit!r} is NEXUS runtime scope. "
+                             f"Workers need an explicit code_edit grant on their task; "
+                             f"only the leader edits the runtime freely."}
+    if allow_code_edit and name in ("exec.shell", "exec.code"):
+        hit = _runtime_touched(name, params)
+        if hit:
+            log_event("TOOL", f"runtime code-edit actor={actor} tool={name} ref={hit!r}")
     fn = TOOL_REGISTRY.get(name)
     if not fn:
-        result = {"success": False, "error": f"Unknown tool: {name}"}
+        # Log-found fix: models hallucinate near-miss names (web_find x10,
+        # None, web_fetch...). Answer with closest matches + the valid list
+        # so the next iteration self-corrects instead of looping failures.
+        try:
+            import difflib
+            valid = sorted(TOOL_REGISTRY.keys()) + ["parallel"]
+            guess = difflib.get_close_matches(str(name or ""), valid, n=3, cutoff=0.5)
+        except Exception:
+            valid, guess = sorted(TOOL_REGISTRY.keys()), []
+        hint = f" Did you mean: {', '.join(guess)}?" if guess else ""
+        result = {"success": False,
+                  "error": f"Unknown tool: {name}.{hint} Valid tools: {', '.join(valid)}"}
         log_tool_call(name, params or {}, result, 0.0)
         log_result("tool", f"{name} FAIL unknown-tool", result, level="WARNING")
         return result
     log_event("TOOL", f"start {name}", extra={"params": params})
     t0 = time.time()
     try:
+        if name == "parallel":
+            params = {**params, "allow_code_edit": bool(allow_code_edit),
+                      "actor": actor}
         if name == "exec.code":
+            params = {**params, "session_workspace": session_workspace}
+        if name == "browser":
             params = {**params, "session_workspace": session_workspace}
         if name == "exec.shell" and session_workspace and not (params or {}).get("cwd"):
             # Session workspace is the home base (agents may still use absolute paths).
             params = {**(params or {}), "cwd": session_workspace}
+        if name == "exec.shell" and (params or {}).get("cwd"):
+            # Log-found fix: models pass phantom dirs ("/workspace") which
+            # hard-fail the spawn with Errno 2. Fall back instead of failing.
+            try:
+                if not Path(str(params["cwd"])).is_dir():
+                    fb = session_workspace if session_workspace and Path(session_workspace).is_dir() \
+                        else str(Path.cwd())
+                    log_event("TOOL", f"exec.shell bad cwd {params['cwd']!r} -> fallback {fb!r}",
+                              level="WARNING")
+                    params = {**(params or {}), "cwd": fb}
+            except Exception:
+                pass
         result = await fn(**params)
     except TypeError as e:
         result = {"success": False, "error": f"Invalid params for {name}: {e}"}
@@ -771,7 +916,8 @@ async def execute_tool(name: str, params: dict, session_workspace: str = None) -
     return result
 
 
-async def tool_parallel(calls: List[dict], session_workspace: str = None) -> dict:
+async def tool_parallel(calls: List[dict], session_workspace: str = None,
+                    allow_code_edit: bool = False, actor: str = "leader") -> dict:
     """Execute multiple tool calls concurrently via asyncio.gather."""
     log_event("TOOL", f"parallel start fanout={len(calls)}",
               extra={"tools": [c.get("tool") for c in calls]})
@@ -779,7 +925,8 @@ async def tool_parallel(calls: List[dict], session_workspace: str = None) -> dic
         t0 = time.time()
         name = call.get("tool")
         params = call.get("params", {})
-        result = await execute_tool(name, params, session_workspace)
+        result = await execute_tool(name, params, session_workspace,
+                                allow_code_edit=allow_code_edit, actor=actor)
         return {"tool": name, "params": params, "result": result, "elapsed": round(time.time() - t0, 3)}
 
     results = await asyncio.gather(*[_one(c) for c in calls], return_exceptions=True)
@@ -798,6 +945,65 @@ async def tool_parallel(calls: List[dict], session_workspace: str = None) -> dic
 
 # Register parallel after definition
 TOOL_REGISTRY["parallel"] = tool_parallel
+
+
+async def tool_runtime_restart(reason: str = "", delay_sec: int = 5,
+                               _exec=None) -> dict:
+    """Restart the NEXUS process (web backend or TUI) via os.execv so verified
+    code edits take effect. Sessions are file-backed and survive; in-flight
+    work is dropped. Leader-only (never offered to workers)."""
+    import sys as _sys
+    import threading as _th
+    reason = (reason or "").strip()
+    if not reason:
+        return {"success": False,
+                "error": "runtime.restart needs a non-empty 'reason' (what changed + how verified)."}
+    try:
+        delay = max(2, min(30, int(delay_sec or 5)))
+    except Exception:
+        delay = 5
+    exe = _sys.executable
+    argv = [_sys.executable] + list(_sys.argv)
+    log_event("SYSTEM", f"runtime.restart in {delay}s pid={__import__('os').getpid()} "
+                         f"reason={reason!r}", level="WARNING")
+
+    def _do():
+        try:
+            (_exec or __import__("os").execv)(exe, argv)
+        except Exception as e:
+            log_event("SYSTEM", f"runtime.restart failed: {e}", level="ERROR")
+
+    _th.Timer(delay, _do).start()
+    return {"success": True, "restart_in_sec": delay, "pid": __import__("os").getpid(),
+            "argv": argv, "reason": reason}
+
+
+TOOL_SPEC_RUNTIME_RESTART = {
+    "type": "function",
+    "function": {
+        "name": "runtime.restart",
+        "description": (
+            "LEADER-ONLY: restart the NEXUS process (web backend or TUI) so your "
+            "VERIFIED code edits take effect. Sessions persist on disk; in-flight "
+            "work is dropped. Rules: reason REQUIRED (what changed + how verified: "
+            "py_compile / node --check / smokes); NEVER restart mid-round — wait "
+            "for rounds to settle and warn the user first; workers can NEVER call "
+            "this (it is not in their tools)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string",
+                           "description": "REQUIRED: what changed + how it was verified"},
+                "delay_sec": {"type": "integer",
+                              "description": "Seconds before restart (2-30, default 5)",
+                              "default": 5},
+            },
+            "required": ["reason"],
+        },
+    },
+}
+TOOL_REGISTRY["runtime.restart"] = tool_runtime_restart
 
 
 # ============================================================
@@ -902,6 +1108,258 @@ TOOL_SPEC_PARALLEL = {
     },
 }
 
+class TreeBudget:
+    """Shared cap for one delegation tree (depth>=2 workers only — the
+    leader's own explicitly-requested fan-out is never truncated by it).
+    Also carries the session-wide used-name registry (shared set object):
+    hologram/radio identity IS the name, so Gatherer1 in two sub-rounds
+    would overwrite one body — duplicates are rejected, never merged.
+    Same event-loop thread: check+claim never splits across an await."""
+    def __init__(self, limit: int, names=None):
+        self.limit = max(1, int(limit))
+        self.used = 0
+        self.names = names if names is not None else set()
+    def room(self) -> int:
+        return max(0, self.limit - self.used)
+    def claim_names(self, ids: list) -> list:
+        """Reserve worker names session-wide. Returns dupes (already used);
+        clean ids are registered. Case-insensitive (matches validation)."""
+        seen = {str(n).lower() for n in self.names}
+        dupes = [i for i in ids if str(i).lower() in seen]
+        if not dupes:
+            for i in ids:
+                self.names.add(str(i))
+        return dupes
+    def claim(self, n: int) -> int:
+        """Claim up to n slots. Returns granted count (0 = exhausted)."""
+        g = max(0, min(int(n), self.limit - self.used))
+        self.used += g
+        return g
+
+
+def resolve_tree_budget(params: dict) -> int:
+    """Leader-declared nested budget for one tree (10x10 hierarchies need it).
+    Falls back to the configured default; clamped to the hard ceiling so one
+    call can never promise an unbounded tree."""
+    try:
+        want = int((params or {}).get("tree_budget") or 0)
+    except Exception:
+        want = 0
+    if want <= 0:
+        return CFG.recursive_max_tree
+    return max(1, min(CFG.recursive_tree_ceiling, want))
+
+
+def scaled_round_timeout(n_workers: int) -> float:
+    """Log-found rule shared by top-level and nested supervisors: a fixed
+    timeout massacres big rounds (20 workers x ~30s/iter x 12 iters /
+    6 LLM slots ~= 1200s). Scale with size, floor at the configured base."""
+    return max(CFG.round_timeout_sec, 60.0 * max(1, int(n_workers)))
+
+
+def recursive_guidance(enabled: bool) -> str:
+    """GENERATED leader guidance for recursive (nested) delegation — built
+    from the live CFG caps so code and prompt can never drift apart.
+    Injected into the leader system prompt every turn (mode-aware)."""
+    d, t, tree = CFG.recursive_max_depth, CFG.recursive_max_tasks, CFG.recursive_max_tree
+    if not enabled:
+        return (
+            "# ── RECURSIVE DELEGATION: OFF ──\n"
+            "NESTED agents exist, but NOT in this session: workers CANNOT call "
+            "agent.delegate here (the depth guard rejects it — tell the user to "
+            "flip the NEST toggle next to the composer, or /recursive on, to allow "
+            "workers that spawn their own sub-workers). Never promise nesting "
+            "while it is off; offer it when a task would genuinely fan out twice.\n")
+    return (
+        "# ── RECURSIVE DELEGATION: ON (NEST MODE — you are the expert) ──\n"
+        f"Workers in this session CAN call agent.delegate themselves (nesting to "
+        f"depth {d}: your workers are depth 1, their children depth 2, "
+        f"grandchildren depth 3 = max, depth-{d} workers get the call REJECTED).\n"
+        "EFFICIENCY (you know the mode is on — use it surgically, not by default): "
+        "prefer flat 4–6 workers; nest ONLY when a subtask itself holds 2+ "
+        "independent workstreams. Announce the depth plan with counts "
+        "(e.g. \"6 miners, 2 of them nesting 3 diggers each\").\n"
+        f"CAPS (hard, enforced): ≤{t} tasks per nested call; ≤{tree} nested "
+        "workers per tree (over-budget calls are TRUNCATED and the result names "
+        "the REMAINDER with a chain-or-report order — obey it literally).\n"
+        "PRE-FLIGHT MATH (mandatory before any nested plan): multiply parents × "
+        f"children-per-parent yourself; pass tree_budget=product+margin on the TOP "
+        f"delegate call (default covers {tree} nested, ceiling {CFG.recursive_tree_ceiling}) — "
+        f"an undeclared 10×10 against a dry budget fails the last parents, who then "
+        f"work solo. Over ceiling: narrow the scope or say so BEFORE launching. "
+        "NAMES are session-unique across ALL rounds (a reused name overwrites a "
+        "hologram body and is REJECTED): order every worker to prefix children "
+        "with its own id (e.g. SubAgent5 spawns 'S5-G1'…'S5-G10').\n"
+        "BRIEF ORDER / NEST-FIRST (enforce it in every nesting brief): step 1 = call "
+        "agent.delegate for the children; step 2 = solo checks WHILE they run; "
+        "step 3 = verify + fold. A worker that solos first burns its round clock "
+        "and may never nest.\n"
+        "SYNC SEMANTICS: a nested round runs INSIDE its parent worker and returns "
+        "as that tool call's result — no background inside nesting; the parent "
+        "waits. Sub-round ids look like R7/D03#1 (parent round / parent worker / "
+        "nest counter).\n"
+        "ISOLATION: each sub-round has its OWN radio + plan. You cannot hear "
+        "sub-round radio, and siblings in different sub-rounds cannot hear each "
+        "other — put cross-cutting facts in shared_context, and make each brief "
+        "fully self-contained.\n"
+        "SYNTHESIS DUTY: verify every child against its OUTPUT contract, then "
+        "fold children into YOUR result (the leader never sees raw child output). "
+        "Count/honesty rules apply recursively: report ok/failed per level, "
+        "never stall, never claim nested work is \"still running\" once its "
+        "round result is in your history.\n")
+
+
+def selfedit_guidance() -> str:
+    """GENERATED leader guidance for SELF-EVOLUTION (edit own runtime code).
+    Injected into the leader system prompt every turn. evolution.py stays the
+    prompt/memory layer (rules, memories, /evolve versions) — THIS block is the
+    code-editing mandate: the leader IS the running NEXUS process."""
+    r = str(APP_ROOT)
+    return (
+        "# ── SELF-EVOLUTION: YOU ARE THE RUNNING CODE ──\n"
+        f"You are the live NEXUS process itself, running from {r}. You can read "
+        "and edit EVERY file of your own runtime — backend AND frontend:\n"
+        f"- backend: {r}/main.py (agent, tools, rounds), {r}/webui.py (web server), "
+        f"{r}/evolution.py (prompt/memory evolution layer — stays as-is, use it, "
+        "do not replace it), {r}/nexus_browser.py, {r}/system_prompt.txt (this file)\n"
+        f"- frontend: {r}/web/index.html, {r}/web/app.js, {r}/web/entity3d.js, "
+        f"{r}/web/styles.css (bump ?v= versions in index.html after editing)\n"
+        f"- state (read mostly, never corrupt): ~/.nexus/sessions/, ~/.nexus/memory.json, "
+        "~/.nexus/evolution/\n"
+        "HOW TO EVOLVE YOURSELF: 1) READ the file first (exec.shell sed/cat or "
+        "Read-equivalent). 2) Make MINIMAL diffs (python scripts editing exact "
+        "strings, never blind rewrites). 3) VERIFY every change: "
+        "`.venv/bin/python -m py_compile main.py webui.py` for backend, "
+        "`node --check web/entity3d.js web/app.js` for frontend, plus the repo "
+        "smoke/unit tests in /tmp when they touch your change. 4) Only then call "
+        "runtime.restart with reason=what+how-verified — never mid-round (wait "
+        "for rounds to settle, warn the user: in-flight work is dropped, "
+        "sessions persist). 5) Report what changed + verification evidence.\n"
+        "EVOLUTION LAYER (stays): keep using memory.read/remember for durable "
+        "lessons and /evolve (history/rollback/why/revalidate) for prompt "
+        "generations — code edits are for behavior the prompt layer cannot fix.\n"
+        "SUBAGENTS: they CANNOT touch the runtime by default (denied + logged). "
+        "Grant surgically with task code_edit:true ONLY when the mission needs "
+        "it (per task, never blanket, never inherited). THEY CAN NEVER RESTART "
+        "— runtime.restart is not in their tools; only you restart, after YOU "
+        "verify their diffs. Never exfiltrate secrets (.env keys stay secret).\n"
+        + _self_knowledge_live())
+
+
+def _self_knowledge_live() -> str:
+    """Deep self-knowledge with LIVE values (budgets, caps, identity) so the
+    leader can plan precisely and edit itself accurately. Generated from CFG +
+    code constants — never hardcode these numbers anywhere else."""
+    try:
+        import os as _os
+        model = CFG.ollama_model if CFG.provider == "ollama" else CFG.model
+        conc = _os.getenv("LLM_MAX_CONCURRENCY", "6")
+        lines = [
+            "# ── DEEP SELF-KNOWLEDGE (live — plan with these exact numbers) ──",
+            f"IDENTITY: provider={CFG.provider} model={model} think={CFG.think_effort} "
+            f"temp={CFG.temperature} max_tokens={CFG.max_tokens} (cloud clamps >65536).",
+            f"BUDGETS: leader_iters={CFG.max_iterations} worker_iters={CFG.subagent_max_iterations} "
+            f"delegate_rounds/turn={CFG.delegate_max_rounds} llm_parallel={conc} "
+            f"(bursts beyond this queue — big rounds take waves).",
+            f"ROUND PHYSICS: quiet_close={CFG.round_quiet_sec}s idle+silent "
+            f"timeout=max({CFG.round_timeout_sec}s, 60s×workers) linger={CFG.worker_linger_sec}s "
+            f"radio_cap={RADIO_MAX_MSGS}x{RADIO_MAX_LEN}chars plan_cap={PLAN_MAX_STEPS} "
+            "drain=8msgs/step summaries=800chars tool_blobs=20000chars.",
+            "SESSIONS: history_restore=40msgs switch wipes UI hologram; workspace="
+            "~/.nexus/sessions/<sid>/workspace; memory_facts_cap=200 (workers read-only).",
+            "HOLOGRAM KEYS: worker_key=sid[-6:]+name labels=1-2words/≤16chars colors=#rrggbb "
+            "session-unique (dupes rejected); retired bodies linger, oldest evicted past 12.",
+            "FRONTEND: web/entity3d.js + web/app.js + web/styles.css served via web/index.html "
+            "— ALWAYS bump ?v= after editing or browsers run stale code.",
+            "TEXT-CALL FALLBACK: native tool_calls preferred; Hermes-style <tool_call> text "
+            "is adopted+executed automatically (truncated JSON salvaged) — never paste raw calls as answer.",
+            "LOGS: nexus.log (2MB×3 rotated) is your flight recorder — diagnose yourself there first.",
+            "DEAD KEYS (do not rely): STEP_LIMIT/TOOL_LIMIT exist in .env but NOTHING reads them.",
+            "RESTART: os.execv(same argv) — sessions survive on disk, in-flight work does NOT; "
+            "web (uvicorn 127.0.0.1:8777) and TUI both re-enter via main.py.",
+        ]
+        return "\n".join(lines) + "\n"
+    except Exception:
+        return ""
+
+
+def worker_codeedit_guidance(granted: bool) -> str:
+    """GENERATED worker-side code-edit rights (appended always: granted block
+    or one-line denial so the worker never guesses)."""
+    if not granted:
+        return ("RUNTIME SCOPE: NEXUS own code is OFF-LIMITS to you (edits are "
+                "denied + logged). Work inside your session workspace; if the "
+                "mission truly needs runtime edits, say so on the radio/your "
+                "result and let the leader re-grant.")
+    r = str(APP_ROOT)
+    return ("RUNTIME CODE-EDIT GRANTED (explicit, this task only): you may "
+            f"read/edit files under {r} (backend + web/ frontend). Rules: "
+            "read-first, minimal diffs, VERIFY (py_compile / node --check / "
+            "relevant smokes) and REPORT diffs + evidence in your result. You "
+            "can NEVER restart — no such tool exists for you; the leader "
+            "restarts after verifying. Never touch secrets (.env values stay "
+            "secret). Grant is NOT inherited by YOUR sub-workers: set "
+            "code_edit:true per task if they need it too.")
+
+
+def worker_nest_guidance(depth: int) -> str:
+    """GENERATED worker-side delegation manual — leader-grade instructions,
+    worker-voiced, minus leader-only powers (user finals, memory writes,
+    restart, background delegation, sessions/evolve). Appended only when the
+    worker is actually offered agent.delegate."""
+    d, t, tree = CFG.recursive_max_depth, CFG.recursive_max_tasks, CFG.recursive_max_tree
+    return (
+        f"DELEGATION MANUAL (you are depth {depth} of {d} — a worker that commands "
+        f"its own workers, exactly like the leader commands you). Your children will "
+        f"be depth {depth + 1}; depth-{d} workers cannot nest further.\n"
+        "1) NEST-FIRST ORDER: if your brief orders sub-workers, agent.delegate is "
+        "your FIRST tool call, before any solo searching — nested rounds take "
+        "minutes and solo work first burns the round clock. Solo checks go WHILE "
+        "children run only if your brief explicitly allows a second phase.\n"
+        "2) EXACT COUNTS OVERRIDE: a named number (\"appoint 10\") beats every "
+        f"default — spawn EXACTLY that many across chained calls (≤{t} each), never "
+        "silently fewer. A truncated result names the REMAINDER and orders you to "
+        "call again with exactly those tasks.\n"
+        "3) BRIEF FRAMEWORK — every child brief MUST carry these 6 labeled lines, "
+        "or the call bounces and you burn a turn: ROLE (specialist title) / GOAL "
+        "(one verifiable sentence) / CONTEXT (only the facts THIS child needs — "
+        "never your whole history) / METHOD (exact tools + parameters + timeouts, "
+        "e.g. web.search queries=[...] max_results=5; web.fetch fmt=txt timeout=20) / "
+        "OUTPUT (exact contract, e.g. '5 lines max: URL | snippet') / TALK "
+        "(coordination pattern + exit, e.g. pattern=FAN_OUT; role=peer; exit when "
+        "all report). Vague briefs produce hallucinated meta-work — write them "
+        "like the brief you yourself received.\n"
+        "4) VALIDATION (hard, enforced — a bounced call returns an error naming "
+        "the bad tasks, fix and re-call): name = REQUIRED, 1–2 words ≤16 chars "
+        "each (letters/digits/_/-/space); color = REQUIRED hex #rrggbb worn on "
+        "its hologram body; brief = REQUIRED non-empty; NAMES are session-unique "
+        "across ALL rounds (a reused name overwrites a hologram body and is "
+        "REJECTED) — ALWAYS prefix children with your own id (e.g. 'S5-G1'…'S5-G10'), "
+        "never bare 'G1'…'G10'.\n"
+        "5) PRE-FLIGHT MATH: your subtree counts against the SAME tree budget "
+        f"(≤{tree} nested per tree) — multiply planned children × grandchildren "
+        "before launching; over budget the last calls fail dry and those children "
+        "never run, so narrow scope or report the cap instead of launching blind.\n"
+        "6) SYNC SEMANTICS: the nested round runs INSIDE you and returns as THIS "
+        "tool call's result — you wait (no background inside nesting). Sub-round "
+        "ids look like R7/D03#1 (parent round / parent worker / counter).\n"
+        "7) ISOLATION: each sub-round has its OWN radio + plan which you cannot "
+        "hear from outside and siblings cannot share — every brief fully "
+        "self-contained, shared facts repeated per child.\n"
+        "8) SYNTHESIS DUTY: VERIFY each child against its OUTPUT contract, then "
+        "fold all children into YOUR result (your parent never sees raw child "
+        "output). Report ok/failed counts per level, partials included.\n"
+        "9) HONESTY: never claim children exist before their round result is in "
+        "your history; never say nested work is 'still running' once its result "
+        "arrived; announce launches as launched. Stalling ('results will arrive "
+        "soon' AFTER they arrived) is a failure.\n"
+        "10) WHAT YOU LACK (do not attempt): final answers to any user, memory "
+        "writes, restarts (no such tool for you — the leader restarts after "
+        "verifying), background delegation (yours is always sync), sessions or "
+        "evolution management. Keep nested rounds small and pointed; stop the "
+        "moment your brief is met.")
+
+
 TOOL_SPEC_DELEGATE = {
     "type": "function",
     "function": {
@@ -911,28 +1369,52 @@ TOOL_SPEC_DELEGATE = {
             "Spawn worker subagents that run CONCURRENTLY, each with an isolated context. "
             "Build every brief with the 6-line framework from your system prompt "
             "(ROLE/GOAL/CONTEXT/METHOD/OUTPUT/TALK) — vague briefs get rejected. "
+            "Every task ALSO needs name + color (both REQUIRED, enforced). "
             "Workers can use exec/web tools but CANNOT delegate further. Their outputs "
             "come back as this tool's result — verify each against its OUTPUT contract, "
-            "then synthesize the single final answer yourself."
+            "then synthesize the single final answer yourself. "
+            "BACKGROUND: this call returns at once with {background, round, workers} "
+            "while the round runs on — you stay free, so end your turn now (tell the "
+            "user work runs in background). Results arrive later as a round update; "
+            "then verify + synthesize + report. "
+            "The round rules: workers that finish early linger (they do NOT exit) "
+            "and wake on any later radio/plan traffic, so later messages always "
+            "land — the round closes itself when all are idle and quiet."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "tasks": {
                     "type": "array",
-                    "description": "Independent subtasks (max honored by server)",
+                    "description": "Independent subtasks (server honors the FULL list — "
+                                   "when the user names an exact worker count, send EXACTLY "
+                                   "that many tasks; default 4-6 per call, chain further "
+                                   "rounds for the rest)",
                     "items": {
                         "type": "object",
                         "properties": {
-                            "id": {"type": "string", "description": "Short task id, e.g. t1"},
+                            "name": {"type": "string",
+                                     "description": "REQUIRED: worker display name, max TWO words "
+                                                    "(letters/digits/_/-/space, e.g. 'Data Miner'). "
+                                                    "Shown under its hologram body; used to address it "
+                                                    "on the radio. Duplicates rejected."},
+                            "color": {"type": "string",
+                                      "description": "REQUIRED hex '#rrggbb' expressing what this "
+                                                     "worker does (e.g. '#b48cff' research). Worn "
+                                                     "INSTEAD of gold on its hologram body."},
                             "brief": {"type": "string",
                                       "description": "REQUIRED, non-empty: self-contained instructions "
                                                      "with the exact goal AND which tool to use "
                                                      "(worker sees nothing else). Empty briefs are rejected."},
                             "context": {"type": "string",
                                         "description": "Background facts the worker needs"},
+                            "code_edit": {"type": "boolean",
+                                          "description": "OPTIONAL, default false: grant THIS worker "
+                                                         "runtime code-edit rights (read/edit NEXUS own "
+                                                         "code incl. web UI). Grant surgically, per task, "
+                                                         "never blanket. Workers can NEVER restart."},
                         },
-                        "required": ["brief"],
+                        "required": ["brief", "name", "color"],
                     },
                 },
             },
@@ -941,9 +1423,61 @@ TOOL_SPEC_DELEGATE = {
     },
 }
 
+TOOL_SPEC_DELEGATE_NEST = {
+    "type": "function",
+    "function": {
+        "name": "agent.delegate",
+        "description": (
+            "NEST MODE: spawn YOUR OWN sub-workers (they run one level deeper). "
+            "The nested round runs INSIDE you and returns as this call's result — "
+            "you wait, then verify each child against its OUTPUT contract and "
+            "fold them into your result. When your brief names an EXACT count, "
+            "spawn EXACTLY that many (chain further calls for any remainder). "
+            "Caps enforced: depth/"
+            "tasks/tree (see your system prompt). Briefs must be self-contained: "
+            "6-line framework (ROLE/GOAL/CONTEXT/METHOD/OUTPUT/TALK) + REQUIRED "
+            "name (max TWO words, unique) + color (#rrggbb) per task."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "Sub-subtasks (truncated to the nested per-call cap with a warning)",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string",
+                                     "description": "REQUIRED: worker display name, max TWO words"},
+                            "color": {"type": "string",
+                                      "description": "REQUIRED hex '#rrggbb'"},
+                            "brief": {"type": "string",
+                                      "description": "REQUIRED, non-empty: self-contained instructions"},
+                            "context": {"type": "string",
+                                        "description": "Background facts the sub-worker needs"},
+                            "code_edit": {"type": "boolean",
+                                          "description": "OPTIONAL, default false: grant THIS sub-worker "
+                                                         "runtime code-edit rights. Set it explicitly per "
+                                                         "task when the mission needs it (never inherited, "
+                                                         "never blanket). No worker can ever restart."},
+                        },
+                        "required": ["brief", "name", "color"],
+                    },
+                },
+            },
+            "required": ["tasks"],
+            "tree_budget": {"type": "integer",
+                            "description": "OPTIONAL: nested-worker budget for this tree "
+                                           "(default covers 100; declare N×M+margin when the "
+                                           "user demands an N×M hierarchy, max 500)"},
+        },
+    },
+}
+
 # Leader sees everything including delegation. Workers get tools but no
-# delegation (depth guard — enforced again in code), plus the round radio
-# and joint plan so they can talk and coordinate with each other.
+# delegation by default (depth guard — enforced again in code; NEST MODE
+# offers TOOL_SPEC_DELEGATE_NEST instead), plus the round radio and joint
+# plan so they can talk and coordinate with each other.
 TOOL_SPEC_SAY = {
     "type": "function",
     "function": {
@@ -988,6 +1522,77 @@ TOOL_SPEC_PLAN = {
     },
 }
 
+TOOL_SPEC_RADIO_LIST = {
+    "type": "function",
+    "function": {
+        "name": "radio.list",
+        "description": (
+            "LEADER-ONLY: list every round group (top-level + nested) with "
+            "live worker states, message counts and done flags. Call FIRST to "
+            "learn group ids, then radio.read / radio.send into any of them."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "active_only": {"type": "boolean",
+                                "description": "Only rounds still open (default false)",
+                                "default": False},
+            },
+        },
+    },
+}
+TOOL_SPEC_RADIO_READ = {
+    "type": "function",
+    "function": {
+        "name": "radio.read",
+        "description": (
+            "LEADER-ONLY: read a round group's radio traffic (any group from "
+            "radio.list, any depth). Use since_seq to page; includes the joint "
+            "plan unless include_plan=false."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "round": {"type": "string",
+                          "description": "REQUIRED: round id, e.g. R3 or R3/D02#1"},
+                "since_seq": {"type": "integer",
+                              "description": "Only messages after this seq (default 0)",
+                              "default": 0},
+                "limit": {"type": "integer",
+                          "description": "Max messages back (1-50, default 20)",
+                          "default": 20},
+                "include_plan": {"type": "boolean",
+                                 "description": "Include the joint plan snapshot (default true)",
+                                 "default": True},
+            },
+            "required": ["round"],
+        },
+    },
+}
+TOOL_SPEC_RADIO_SEND = {
+    "type": "function",
+    "function": {
+        "name": "radio.send",
+        "description": (
+            "LEADER-ONLY: speak INTO a round group as 'leader' (any group from "
+            "radio.list). to='all' (default) wakes every lingering worker; name "
+            "one worker id to wake just it. Closed rounds reject the message."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "round": {"type": "string",
+                          "description": "REQUIRED: round id, e.g. R3 or R3/D02#1"},
+                "to": {"type": "string",
+                       "description": "Worker id or 'all' (default 'all')",
+                       "default": "all"},
+                "text": {"type": "string",
+                         "description": "REQUIRED: message (max ~500 chars)"},
+            },
+            "required": ["round", "text"],
+        },
+    },
+}
 TOOL_SPEC_MEM_READ = {
     "type": "function",
     "function": {
@@ -1031,11 +1636,12 @@ TOOL_SPEC_MEM_PROFILE = {
 }
 
 WORKER_TOOLS = [TOOL_SPEC_EXEC_SHELL, TOOL_SPEC_EXEC_CODE,
-                TOOL_SPEC_WEB_SEARCH, TOOL_SPEC_WEB_FETCH, TOOL_SPEC_PARALLEL,
+                TOOL_SPEC_WEB_SEARCH, TOOL_SPEC_WEB_FETCH, TOOL_SPEC_BROWSER, TOOL_SPEC_PARALLEL,
                 TOOL_SPEC_SAY, TOOL_SPEC_PLAN, TOOL_SPEC_MEM_READ]
 LEADER_TOOLS = [TOOL_SPEC_EXEC_SHELL, TOOL_SPEC_EXEC_CODE,
-                TOOL_SPEC_WEB_SEARCH, TOOL_SPEC_WEB_FETCH, TOOL_SPEC_PARALLEL,
-                TOOL_SPEC_DELEGATE,
+                TOOL_SPEC_WEB_SEARCH, TOOL_SPEC_WEB_FETCH, TOOL_SPEC_BROWSER, TOOL_SPEC_PARALLEL,
+                TOOL_SPEC_DELEGATE, TOOL_SPEC_RUNTIME_RESTART,
+                TOOL_SPEC_RADIO_LIST, TOOL_SPEC_RADIO_READ, TOOL_SPEC_RADIO_SEND,
                 TOOL_SPEC_MEM_READ, TOOL_SPEC_MEM_REMEMBER,
                 TOOL_SPEC_MEM_FORGET, TOOL_SPEC_MEM_PROFILE]
 
@@ -1087,8 +1693,171 @@ def _is_error_content(content: str) -> bool:
     return c.startswith("[LLM error]") or c.startswith("[Ollama error]")
 
 
+_HFAIL = object()
+
+
+def _hfind(seg: str, tag: str, lo: int, hi: int):
+    """Find <tag = value> in seg[lo:hi]; returns (value, end) or (None, -1)."""
+    i = seg.lower().find("<" + tag, lo, hi)
+    if i < 0:
+        return None, -1
+    j = i + 1 + len(tag)
+    while j < hi and seg[j] in " \t\r\n":
+        j += 1
+    if j >= hi or seg[j] != "=":
+        return None, -1
+    j += 1
+    while j < hi and seg[j] in " \t\r\n":
+        j += 1
+    k = j
+    while k < hi and seg[k] not in " \t\r\n>":
+        k += 1
+    if k <= j:
+        return None, -1
+    return seg[j:k].strip(), k + (1 if k < hi and seg[k] == ">" else 0)
+
+
+def _hjson(seg: str, base: int):
+    """Parse one JSON value at seg[base:] (leading ws skipped).
+    Returns (value, abs_end, partial). Partial=True when a truncated array
+    was salvaged (complete items kept, broken tail dropped)."""
+    rest0 = seg[base:]
+    p = base + (len(rest0) - len(rest0.lstrip()))
+    try:
+        obj, end = json.JSONDecoder().raw_decode(seg[p:])
+        return obj, p + end, False
+    except Exception:
+        pass
+    if p < len(seg) and seg[p] == "[":
+        arr, q = [], p + 1
+        while q < len(seg):
+            while q < len(seg) and seg[q] in " \t\r\n,":
+                q += 1
+            if q >= len(seg) or seg[q] == "]":
+                break
+            try:
+                o, e = json.JSONDecoder().raw_decode(seg[q:])
+            except Exception:
+                break
+            arr.append(o)
+            q += e
+        if arr:
+            return arr, q, True
+    return _HFAIL, p, False
+
+
+def _extract_text_calls(text: str, valid_names) -> tuple:
+    """Parse Hermes-style TEXT tool calls some models emit instead of native
+    calls: <tool_call> <function=NAME> <parameter=P> <json> (</tool_call>).
+    Returns (stripped_text, calls). Unknown names / unparseable JSON are left
+    in the text (never execute blind)."""
+    if not text or "<tool_call>" not in text.lower():
+        return text, []
+    valid = {str(n) for n in (valid_names or []) if n}
+    out_calls, spans = [], []
+    low, idx, n = text.lower(), 0, 0
+    # Span boundaries come from PARSED JSON ends, never from </tool_call>
+    # (log-found: a bogus closer inside a brief truncated the strip and
+    # 27KB kept leaking). A truncated tail is swallowed to the next opener.
+    while True:
+        s = low.find("<tool_call>", idx)
+        if s < 0:
+            break
+        nxt = low.find("<tool_call>", s + 11)
+        seg_end = nxt if nxt >= 0 else len(text)
+        seg = text[s:seg_end]
+        name, hend = _hfind(seg, "function", 0, min(500, len(seg)))
+        params, ok_parse, value_end, partial = {}, bool(name and name in valid), 0, False
+        if ok_parse:
+            ppos = hend
+            while True:
+                pname, pend = _hfind(seg, "parameter", ppos, len(seg))
+                if pname is None:
+                    break
+                val, vend, is_partial = _hjson(seg, pend)
+                if val is _HFAIL:
+                    ok_parse = False
+                    break
+                params[pname] = val
+                value_end = vend
+                if is_partial:
+                    partial = True
+                    break
+                ppos = vend
+        if ok_parse and params:
+            span_end = s + value_end
+            if partial:
+                span_end = seg_end
+            else:
+                q = span_end
+                while q < seg_end and text[q] in " \t\r\n":
+                    q += 1
+                if text[q:q + 12].lower() == "</tool_call>":
+                    q += 12
+                span_end = q
+            if partial:
+                params["_recovered_partial"] = True
+            out_calls.append({"id": f"text_{n}", "name": name,
+                              "arguments": json.dumps(params, ensure_ascii=False)})
+            spans.append((s, span_end))
+            n += 1
+            idx = seg_end
+        else:
+            idx = s + 11
+    if not out_calls:
+        return text, []
+    stripped = text
+    for s, e in sorted(spans, reverse=True):
+        stripped = stripped[:s] + stripped[e:]
+    while "\n\n\n" in stripped:
+        stripped = stripped.replace("\n\n\n", "\n\n")
+    return stripped.strip(), out_calls
+
+
+def _adopt_text_calls(content: str, specs, who: str, sid: str):
+    """Adopt text-formatted calls as real ones (log-found: models emitting
+    <tool_call> text had their 31KB pseudo-calls delivered as the ANSWER).
+    Returns (content, calls) with blocks stripped from content."""
+    names = [s.get("function", {}).get("name", "") for s in (specs or [])]
+    stripped, calls = _extract_text_calls(content or "", names)
+    if calls:
+        log_event("LLM" if who == "leader" else "SUBAGENT",
+                  f"adopted {len(calls)} text tool call(s) sid={sid} "
+                  f"({', '.join(c['name'] for c in calls)}) — stripped from answer",
+                  level="WARNING")
+    return stripped, calls
+
+
+def _is_billing_error(content: str) -> bool:
+    """402 / free-usage / credits errors must NOT be retried — retrying a
+    billing refusal 3x only burns time (log shows 3x 402 bursts)."""
+    c = (content or "").lower()
+    return ("402" in c or "free usage" in c or "usage credits" in c
+            or "pay as you go" in c or "upgrade for included" in c)
+
+
 MODEL_UNAVAILABLE = ("The model endpoint is temporarily failing on Ollama's side (cloud error). "
                      "Nothing is wrong with NEXUS — please send your message again in a moment.")
+
+MODEL_BILLING = ("This Ollama cloud model is not included in free usage (402) — "
+                 "add usage credits at https://ollama.com/settings or switch to a free model "
+                 "with /models (or /model <name>). Nothing is wrong with NEXUS itself.")
+
+
+_llm_sem: Optional[asyncio.Semaphore] = None
+
+
+def _llm_semaphore() -> asyncio.Semaphore:
+    """Cap concurrent model calls (log-found fix: Ollama 429 bursts when the
+    leader + a worker wave all fire at once). Env LLM_MAX_CONCURRENCY."""
+    global _llm_sem
+    if _llm_sem is None:
+        try:
+            n = max(1, int(os.getenv("LLM_MAX_CONCURRENCY", "6")))
+        except Exception:
+            n = 6
+        _llm_sem = asyncio.Semaphore(n)
+    return _llm_sem
 
 
 class LLMProvider:
@@ -1104,19 +1873,27 @@ class LLMProvider:
                          f"msgs={len(messages)} tools={len(tools) if tools else 0}")
         out: dict = {"content": "", "tool_calls": [], "thinking": "", "raw": None}
         attempts = 0
-        while True:
-            attempts += 1
-            if self.cfg.provider == "ollama":
-                out = await self._ollama(messages, tools)
-            else:
-                out = await self._openai(messages, tools)
-            content = out.get("content", "") or ""
-            if not _is_error_content(content) or attempts > retries:
-                break
-            wait = 1.5 * attempts
-            log_event("LLM", f"attempt {attempts} failed ({_short(content, 120)}), "
-                             f"retrying in {wait:.1f}s", level="WARNING")
-            await asyncio.sleep(wait)
+        # One slot per in-flight call: bursts (leader + worker wave) queue
+        # instead of slamming the endpoint into 429s. Never held across turns.
+        async with _llm_semaphore():
+            while True:
+                attempts += 1
+                if self.cfg.provider == "ollama":
+                    out = await self._ollama(messages, tools)
+                else:
+                    out = await self._openai(messages, tools)
+                content = out.get("content", "") or ""
+                if not _is_error_content(content) or attempts > retries:
+                    break
+                if _is_billing_error(content):
+                    # Billing refusal will never succeed on retry — stop now.
+                    log_event("LLM", f"attempt {attempts} billing refusal (402), "
+                                     f"not retrying", level="ERROR")
+                    break
+                wait = 1.5 * attempts
+                log_event("LLM", f"attempt {attempts} failed ({_short(content, 120)}), "
+                                 f"retrying in {wait:.1f}s", level="WARNING")
+                await asyncio.sleep(wait)
         latency = round(time.time() - t0, 3)
         content = out.get("content", "") or ""
         n_tc = len(out.get("tool_calls", []) or [])
@@ -1231,6 +2008,13 @@ PLAN_MAX_STEPS = 100
 class DelegateRound:
     """Shared war-room for ONE agent.delegate fan-out: radio bus + joint plan.
 
+    The round RULES: no worker exits permanently while the round is open.
+    A worker that finishes its own task goes IDLE (lingering) instead of
+    exiting; any radio directed at it (`to=all` or `to=<id>`) or any plan
+    change wakes it back to work. Only the supervisor (leader) closing the
+    round — after all workers idle + radio quiet, or on timeout — releases
+    workers to return for good.
+
     All workers run as coroutines on the same event-loop thread, so plain
     lists are safe (no await happens between a read and its paired write).
     Workers drain new traffic before every LLM call, so they genuinely read
@@ -1243,6 +2027,39 @@ class DelegateRound:
         self.messages: List[dict] = []  # {seq, from, to, text, ts}
         self.plan: List[dict] = []      # {id, title, status, owner, note}
         self.plan_version = 0
+        self.done = False
+        self.states: Dict[str, str] = {wid: "working" for wid in worker_ids}
+        self.last_activity = time.time()
+        self.nested_active = 0  # sub-rounds in flight under this round's workers
+        self.children: Dict[str, "DelegateRound"] = {}  # sub_rid -> sub-round (nest tree)
+
+    def note_activity(self):
+        """Any radio/plan traffic resets the quiet clock. Never raises."""
+        try:
+            self.last_activity = time.time()
+        except Exception:
+            pass
+
+    def set_state(self, wid: str, state: str):
+        """working | idle | done. Never raises."""
+        try:
+            if wid in self.states:
+                self.states[wid] = state
+        except Exception:
+            pass
+
+    def close(self, reason: str = ""):
+        """End the round: lingering workers are released to return. Idempotent."""
+        if self.done:
+            return
+        self.done = True
+        try:
+            for wid in self.states:
+                if self.states[wid] != "done":
+                    self.states[wid] = "done"
+        except Exception:
+            pass
+        log_event("ROUND", f"round={self.rid} CLOSED ({reason or 'no reason'})")
 
     def snapshot_plan(self) -> List[dict]:
         return [dict(s) for s in self.plan]
@@ -1251,21 +2068,27 @@ class DelegateRound:
         text = _short((text or "").strip(), RADIO_MAX_LEN)
         if not text:
             return {"success": False, "error": "empty message — say something or skip radio"}
+        if self.done:
+            return {"success": False, "error": f"round {self.rid} is closed — message dropped"}
         if len(self.messages) >= RADIO_MAX_MSGS:
             return {"success": False, "error": "radio full (100 msgs); stop chatting and finish the task"}
-        to = (to or "all").strip() or "all"
+        to = " ".join((to or "all").strip().split()) or "all"
         self.seq += 1
         msg = {"seq": self.seq, "from": frm, "to": to, "text": text,
                "ts": datetime.now().strftime("%H:%M:%S")}
         self.messages.append(msg)
+        self.note_activity()
         log_event("RADIO", f"round={self.rid} #{msg['seq']} {frm}->{to}: {_short(text, 200)!r}")
         return {"success": True, "seq": self.seq}
 
     def plan_op(self, frm: str, action: str, step_id: str = "",
-                title: str = "", note: str = "") -> dict:
+                  title: str = "", note: str = "") -> dict:
         action = (action or "list").strip().lower()
         if action == "list":
             return {"success": True, "plan": self.snapshot_plan(), "version": self.plan_version}
+        if self.done:
+            return {"success": False, "error": f"round {self.rid} is closed",
+                    "plan": self.snapshot_plan()}
         if action == "add":
             if len(self.plan) >= PLAN_MAX_STEPS:
                 return {"success": False, "error": "plan full (100 steps max)"}
@@ -1275,6 +2098,7 @@ class DelegateRound:
             self.plan.append({"id": sid, "title": _short((title or "").strip(), 200) or "untitled step",
                               "status": "open", "owner": "", "note": ""})
             self.plan_version += 1
+            self.note_activity()
             log_event("PLAN", f"round={self.rid} {frm} add {sid}")
             return {"success": True, "step": sid, "plan": self.snapshot_plan(),
                     "version": self.plan_version}
@@ -1295,6 +2119,7 @@ class DelegateRound:
         else:
             return {"success": False, "error": f"unknown action {action!r} (add/claim/done/note/list)"}
         self.plan_version += 1
+        self.note_activity()
         log_event("PLAN", f"round={self.rid} {frm} {action} {step['id']}")
         return {"success": True, "step": step["id"], "plan": self.snapshot_plan(),
                 "version": self.plan_version}
@@ -1319,6 +2144,51 @@ class DelegateRound:
             else:
                 lines.append("PLAN (empty)")
         return "\n".join(lines)
+
+
+def _validate_delegate_tasks(tasks: list) -> Optional[str]:
+    """Shared hard validation for agent.delegate (leader AND nested worker
+    paths): every task needs a NAME (max two words, hologram/radio identity),
+    a COLOR (#rrggbb), and a non-empty self-contained brief. Mutates tasks
+    in place (sets id/color). Returns an error string, or None when valid."""
+    import re as _re
+    _name_ok = _re.compile(r"[A-Za-z0-9_][A-Za-z0-9_ \-]{0,30}[A-Za-z0-9_]?$")
+    _hex_ok = _re.compile(r"#([0-9a-fA-F]{6}|[0-9a-fA-F]{3})$")
+    bad_name, bad_color, seen = [], [], set()
+    for i, t in enumerate(tasks):
+        raw_name = " ".join(str(t.get("name", "") or "").split())
+        words = raw_name.split(" ") if raw_name else []
+        good_words = (1 <= len(words) <= 2 and all(1 <= len(w) <= 16 for w in words)
+                      and _name_ok.match(raw_name) is not None)
+        key = raw_name.lower()
+        if not good_words:
+            bad_name.append(f"task#{i + 1}")
+        elif key in seen:
+            bad_name.append(f"task#{i + 1} (duplicate name {raw_name!r})")
+        else:
+            seen.add(key)
+            t["id"] = raw_name  # the hologram/radio identity IS the name
+        raw_color = str(t.get("color", "") or "").strip()
+        m = _hex_ok.match(raw_color)
+        if not m:
+            bad_color.append(t.get("id", f"task#{i + 1}"))
+        else:
+            h = m.group(1)
+            if len(h) == 3:
+                h = "".join(c * 2 for c in h)
+            t["color"] = "#" + h.lower()
+    if bad_name:
+        return (f"tasks {bad_name} need a 'name' (REQUIRED, max TWO words, "
+                f"letters/digits/_/-/space, e.g. 'Data Miner'). Re-call with names.")
+    if bad_color:
+        return (f"tasks {bad_color} need a 'color' (REQUIRED hex like '#b48cff' "
+                f"expressing what the worker does — worn instead of gold). Re-call with colors.")
+    bad = [t.get("id", f"t{i + 1}") for i, t in enumerate(tasks)
+           if not (t.get("brief") or "").strip()]
+    if bad:
+        return (f"tasks {bad} have empty 'brief'. Re-call with a non-empty, "
+                f"self-contained 'brief' per task (exact goal + which tool to use).")
+    return None
 
 
 # ============================================================
@@ -1350,6 +2220,13 @@ class NexusAgent:
         self.pending_files: List[dict] = []  # uploads waiting for next turn [{name,size}]
         self.on_event: Optional[Callable] = None  # callback for TUI (legacy single)
         self.listeners: List[Callable] = []  # extra fan-out targets (e.g. web UI bus)
+        self.stop_event: Optional[Any] = None  # set by web STOP button; checked cooperatively
+        self.on_round_done: Optional[Callable] = None  # web: async cb(summary) on bg round close
+        self._bg_rounds: Dict[str, dict] = {}  # rid -> {rnd, tasks, ids, t0, task}
+        self.pending_round_notes: List[str] = []  # finished-round summaries awaiting synthesis
+        self.recursive_mode: bool = False  # NEST MODE: workers may spawn sub-workers (toggle)
+        self._used_worker_names: set = set()  # every worker name this session (hologram keys)
+        self._rounds: Dict[str, DelegateRound] = {}  # rid -> round (radio readable/writable)
         try:
             import evolution
             _rec = evolution.EvolutionRecorder()
@@ -1383,7 +2260,16 @@ Session ID: {self.sid}
             base = evolution.active_prompt_text(base, evo_base or evolution.EVODIR)
         except Exception as e:
             log_event("AGENT", f"evolution layer skipped: {e}", level="DEBUG")
-        return base + ctx
+        try:
+            rec_block = recursive_guidance(bool(getattr(self, "recursive_mode", False)))
+        except Exception:
+            rec_block = ""
+        try:
+            self_block = selfedit_guidance()
+        except Exception:
+            self_block = ""
+        return base + ("\n\n" + rec_block if rec_block else "") + \
+            ("\n\n" + self_block if self_block else "") + ctx
 
     def _refresh_system(self, extra_context: str = "", evo_base=None):
         """Rebuild history[0] so a long-lived agent picks up evolved rules,
@@ -1405,6 +2291,14 @@ Session ID: {self.sid}
                 self.listeners.append(fn)
         except Exception:
             pass
+
+    def _stopped(self) -> bool:
+        """Cooperative STOP flag (web STOP button). Never raises."""
+        try:
+            ev = getattr(self, "stop_event", None)
+            return bool(ev is not None and ev.is_set())
+        except Exception:
+            return False
 
     def _emit(self, event: str, data: dict):
         for target in ([self.on_event] if self.on_event else []) + list(self.listeners):
@@ -1448,6 +2342,22 @@ Session ID: {self.sid}
                 self._evo_rec.run_start(self.sid, self.turn_n, user_input, self.workspace)
         except Exception as e:
             log_event("AGENT", f"turn preamble failed: {e}", level="DEBUG")
+        notes = getattr(self, "pending_round_notes", None) or []
+        if notes:
+            self.pending_round_notes = []
+            # Log-found fix: this used to ride as a mid-thread `system` message
+            # with soft wording — the model twice replied "still waiting" WITH
+            # the results already in context, then told the user agents were
+            # "still running" after they had finished. User role + hard order.
+            note = ("[BACKGROUND ROUNDS finished — the results are pasted BELOW. "
+                    "You MUST synthesize and report them to the user now, then handle "
+                    "the new request. Do NOT say you are waiting for results — they "
+                    "are already here. Never claim background work is still running "
+                    "when its round note is in this history:]\n"
+                    + "\n".join(notes))
+            self.history.append({"role": "user", "content": note})
+            self.sm.add_message(self.sid, "user", note)
+            log_event("AGENT", f"injected {len(notes)} background round note(s) sid={self.sid}")
         self.history.append({"role": "user", "content": user_input})
         self.sm.add_message(self.sid, "user", user_input)
         pending = getattr(self, "pending_files", None) or []
@@ -1464,11 +2374,38 @@ Session ID: {self.sid}
 
         final = ""
         for iteration in range(CFG.max_iterations):
+            if self._stopped():
+                final = "⏹ Stopped by user — partial work above is kept."
+                self.history.append({"role": "assistant", "content": final})
+                self.sm.add_message(self.sid, "assistant", final)
+                self._emit("final", {"content": final, "workspace": self.workspace,
+                                     "stopped": True})
+                log_event("AGENT", f"stopped by user sid={self.sid} iter={iteration + 1}")
+                break
             self._emit("iteration", {"n": iteration + 1, "max": CFG.max_iterations})
             log_event("AGENT", f"iteration {iteration + 1}/{CFG.max_iterations} sid={self.sid}")
             llm_out = await self.llm.chat(self.history, tools=LEADER_TOOLS)
+            if self._stopped():
+                final = "⏹ Stopped by user — partial work above is kept."
+                self.history.append({"role": "assistant", "content": final})
+                self.sm.add_message(self.sid, "assistant", final)
+                self._emit("final", {"content": final, "workspace": self.workspace,
+                                     "stopped": True})
+                log_event("AGENT", f"stopped by user sid={self.sid} iter={iteration + 1}")
+                break
+            if isinstance(llm_out, str):
+                log_event("AGENT", f"sid={self.sid} LLM returned bare str — wrapped",
+                          level="WARNING")
+                llm_out = {"content": llm_out, "tool_calls": []}
             content = llm_out.get("content", "") or ""
             tool_calls = llm_out.get("tool_calls", []) or []
+            if any(not isinstance(c, dict) for c in tool_calls):
+                log_event("AGENT", f"sid={self.sid} dropped non-dict tool call(s)",
+                          level="WARNING")
+                tool_calls = [c for c in tool_calls if isinstance(c, dict)]
+            if not tool_calls:
+                content, tool_calls = _adopt_text_calls(
+                    content, LEADER_TOOLS, "leader", self.sid)
             if llm_out.get("thinking"):
                 self._emit("thinking", {"who": "leader", "text": llm_out["thinking"]})
 
@@ -1479,7 +2416,7 @@ Session ID: {self.sid}
                     # raw "[Ollama error] ... (ref:...)" text as the answer.
                     log_event("AGENT", f"final UNAVAILABLE sid={self.sid} iter={iteration + 1}",
                               level="WARNING")
-                    final = MODEL_UNAVAILABLE
+                    final = MODEL_BILLING if _is_billing_error(content) else MODEL_UNAVAILABLE
                 else:
                     final = content
                     log_event("AGENT", f"final sid={self.sid} iter={iteration + 1} len={len(content)}")
@@ -1574,8 +2511,11 @@ Session ID: {self.sid}
         t0 = time.time()
         if tc.get("name") == "agent.delegate":
             result = await self._delegate(params)
+        elif tc.get("name") in ("radio.list", "radio.read", "radio.send"):
+            result = self._radio_op(tc.get("name", ""), params)
         else:
-            result = await execute_tool(tc.get("name", ""), params, self.workspace)
+            result = await execute_tool(tc.get("name", ""), params, self.workspace,
+                                allow_code_edit=True, actor="leader")
         return params, result, round(time.time() - t0, 3)
 
     async def _delegate(self, params: dict) -> dict:
@@ -1595,16 +2535,11 @@ Session ID: {self.sid}
         for i, t in enumerate(tasks):
             if not isinstance(t, dict):
                 tasks[i] = {"brief": str(t)}
-            tasks[i].setdefault("id", f"t{i + 1}")
-        # Hard validation: empty briefs make workers hallucinate meta-work
-        # ("create initial plan") instead of doing the job. Bounce back so
-        # the leader retries WITH real briefs.
-        bad = [t.get("id", f"t{i + 1}") for i, t in enumerate(tasks)
-               if not (t.get("brief") or "").strip()]
-        if bad:
-            return {"success": False,
-                    "error": f"tasks {bad} have empty 'brief'. Re-call with a non-empty, "
-                             f"self-contained 'brief' per task (exact goal + which tool to use)."}
+        # Hard validation shared with nested workers (see
+        # _validate_delegate_tasks): NAME + COLOR + non-empty brief.
+        err = _validate_delegate_tasks(tasks)
+        if err:
+            return {"success": False, "error": err}
         # Loop guard: a leader that re-delegates instead of synthesizing is
         # capped — afterwards it must answer from what it already has.
         self._delegate_rounds = getattr(self, "_delegate_rounds", 0) + 1
@@ -1617,40 +2552,297 @@ Session ID: {self.sid}
         self.round_n += 1
         rid = f"R{self.round_n}"
         rnd = DelegateRound(rid, ids)
-        self._emit("delegate_start", {"round": rid, "count": len(tasks), "ids": ids})
+        rnd.note_activity()  # birth counts as activity (no instant close)
+        self._remember_round(rid, rnd)
+        self._emit("delegate_start", {"round": rid, "count": len(tasks), "ids": ids,
+                                        "colors": {t.get("id"): t.get("color", "#D4AF37")
+                                                   for t in tasks}})
         log_event("AGENT", f"delegate start sid={self.sid} round={rid} workers={ids}")
         t0 = time.time()
-        results = await asyncio.gather(*[self._run_worker(t, rnd) for t in tasks])
+        tree = TreeBudget(resolve_tree_budget(params), names=self._used_worker_names)
+        dupes = tree.claim_names(ids)
+        if dupes:
+            return {"success": False,
+                    "error": f"names {dupes} are already used by other workers this "
+                             f"session (one hologram body per name — reusing a name "
+                             f"would overwrite it). Re-call with unique names "
+                             f"(e.g. prefix with the round: 'R{self.round_n}-Miner')."}
+        if getattr(self, "recursive_mode", False):
+            log_event("AGENT", f"delegate tree budget sid={self.sid} round={rid} "
+                                f"nested_cap={tree.limit}")
+        if self.on_round_done is None:
+            # TUI/CLI: no completion hook -> classic BLOCKING supervised round.
+            futs = [asyncio.ensure_future(self._run_worker(t, rnd, tree)) for t in tasks]
+            results = await self._supervise_round(rnd, futs, ids, t0)
+            return self._finish_round(rnd, tasks, ids, results, t0)
+        # WEB: BACKGROUND round — the leader (and the user) stays free for
+        # anything else. Results come back through on_round_done and are
+        # injected into the leader on a later turn (or auto-reported).
+        record = {"rid": rid, "rnd": rnd, "tasks": tasks, "ids": ids, "t0": t0,
+                  "done": False, "task": None, "tree": tree}
+        self._bg_rounds[rid] = record
+        record["task"] = asyncio.ensure_future(self._run_round_background(record))
+        return {"success": True, "background": True, "round": rid, "workers": ids,
+                "note": ("Round started in the BACKGROUND — you stay free for anything "
+                         "else the user asks. Do NOT wait: end your turn now (tell the user "
+                         "work is running in background). Report ONLY this launch "
+                         "(round id + worker count + background). NEVER describe children, "
+                         "sub-agents, or results that do not exist yet — they arrive as a "
+                         "round update which you will synthesize and report to the user then.")}
+
+    async def _supervise_round(self, rnd: DelegateRound, futs: list,
+                               ids: list, t0: float) -> list:
+        """SUPERVISED round (the round rules): workers linger instead of
+        exiting, so a bare gather would hang. Tick instead: close when all
+        workers idle/done AND the radio has been quiet, or on timeout.
+        Quiet + no traffic ever -> instant close (independent tasks).
+        Returns the per-worker result dicts in task order."""
+        pending = set(futs)
+        grace_until = 0.0
+        # Log-found fix: a fixed 600s timeout massacres big rounds (20 workers
+        # x ~30s/iter x 12 iters / 6 LLM slots ~= 1200s). Scale with size.
+        timeout = max(CFG.round_timeout_sec, 60.0 * max(1, len(ids)))
+        log_event("AGENT", f"delegate supervise sid={self.sid} round={rnd.rid} "
+                            f"workers={len(ids)} timeout={timeout:.0f}s")
+        try:
+            while pending:
+                if self._stopped():
+                    rnd.close("stopped by user")
+                _done, pending = await asyncio.wait(pending, timeout=1.0)
+                if not pending:
+                    break
+                if rnd.done:
+                    if grace_until and time.time() > grace_until:
+                        for f in list(pending):
+                            f.cancel()
+                    continue
+                try:
+                    states = [rnd.states.get(wid, "done") for wid in ids]
+                    quiet_for = time.time() - rnd.last_activity
+                    need = 0.0 if (rnd.seq == 0 and rnd.plan_version == 0) else CFG.round_quiet_sec
+                    if all(s in ("idle", "done") for s in states) and quiet_for >= need:
+                        rnd.close(f"all idle + quiet {quiet_for:.0f}s")
+                        continue
+                    if time.time() - t0 > timeout and getattr(rnd, "nested_active", 0) <= 0:
+                        rnd.close(f"round timeout {timeout:.0f}s")
+                        grace_until = time.time() + 60
+                except Exception as e:
+                    log_event("AGENT", f"delegate supervisor tick failed: {e}",
+                              level="WARNING")
+        finally:
+            rnd.close("delegate settled")
+            for f in pending:
+                f.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        results = []
+        for wid, f in zip(ids, futs):
+            try:
+                results.append(f.result())
+            except asyncio.CancelledError:
+                results.append({"id": wid, "brief": "", "output": "",
+                                "error": "cancelled", "success": False,
+                                "tools_used": 0, "radio_seen": 0,
+                                "radio_sent": 0, "elapsed": 0})
+            except Exception as e:
+                results.append({"id": wid, "brief": "", "output": "",
+                                "error": f"worker crashed: {e}", "success": False,
+                                "tools_used": 0, "radio_seen": 0,
+                                "radio_sent": 0, "elapsed": 0})
+        return results
+
+    def _finish_round(self, rnd: DelegateRound, tasks: list, ids: list,
+                      results: list, t0: float) -> dict:
+        """Persist + announce a closed round. Shared by sync and background paths."""
         elapsed = round(time.time() - t0, 3)
         n_ok = sum(1 for r in results if r.get("success"))
-        out = {"success": True, "round": rid, "results": results,
+        out = {"success": True, "round": rnd.rid, "results": results,
                "plan": rnd.snapshot_plan(),
                "elapsed": elapsed, "ok": n_ok, "failed": len(results) - n_ok}
         # Persist ONE entry for the whole fan-out (worker traces stay in the log).
-        self.sm.add_tool_call(self.sid, "agent.delegate",
-                              {"tasks": [{k: t.get(k) for k in ("id", "brief")} for t in tasks]},
-                              out, elapsed)
-        log_event("AGENT", f"delegate done sid={self.sid} round={rid} ok={n_ok}/{len(results)} "
-                           f"elapsed={elapsed:.1f}s radio={rnd.seq} plan_v{rnd.plan_version}")
-        log_result("agent", f"delegate done sid={self.sid} round={rid} ok={n_ok}/{len(results)}", out)
-        self._emit("delegate_done", {"round": rid, "ok": n_ok, "failed": len(results) - n_ok,
+        try:
+            self.sm.add_tool_call(self.sid, "agent.delegate",
+                                  {"tasks": [{k: t.get(k) for k in ("id", "brief")} for t in tasks]},
+                                  out, elapsed)
+        except Exception as e:
+            log_event("SAVE", f"delegate persist failed sid={self.sid}: {e}", level="ERROR")
+        log_event("AGENT", f"delegate done sid={self.sid} round={rnd.rid} ok={n_ok}/{len(results)} "
+                            f"elapsed={elapsed:.1f}s radio={rnd.seq} plan_v{rnd.plan_version}")
+        log_result("agent", f"delegate done sid={self.sid} round={rnd.rid} ok={n_ok}/{len(results)}", out)
+        self._emit("delegate_done", {"round": rnd.rid, "ok": n_ok, "failed": len(results) - n_ok,
                                      "elapsed": elapsed, "plan": rnd.snapshot_plan()})
         return out
 
-    async def _run_worker(self, task: dict, rnd: DelegateRound) -> dict:
+    def _remember_round(self, rid: str, rnd) -> None:
+        """Register a round for radio.list/read/send; prune oldest CLOSED
+        beyond 30 (active rounds are never pruned)."""
+        try:
+            self._rounds[rid] = rnd
+            if len(self._rounds) > 30:
+                for old_rid, old_rnd in list(self._rounds.items()):
+                    if len(self._rounds) <= 30:
+                        break
+                    if getattr(old_rnd, "done", True) and old_rid != rid:
+                        del self._rounds[old_rid]
+        except Exception:
+            pass
+
+    def _find_round(self, rid: str):
+        """Top-level round or any nested descendant (walk children)."""
+        if not rid:
+            return None
+        if rid in (self._rounds or {}):
+            return self._rounds[rid]
+        stack = list((self._rounds or {}).values())
+        while stack:
+            r = stack.pop()
+            if getattr(r, "rid", None) == rid:
+                return r
+            try:
+                stack.extend((getattr(r, "children", None) or {}).values())
+            except Exception:
+                pass
+        return None
+
+    def _radio_op(self, name: str, params: dict) -> dict:
+        """LEADER-ONLY radio trio: list groups, read any group's traffic,
+        speak into any group as 'leader' (wakes lingering workers)."""
+        params = params or {}
+        if name == "radio.list":
+            active_only = params.get("active_only") is True
+            rows = []
+
+            def walk(r, depth, parent):
+                try:
+                    states = getattr(r, "states", {}) or {}
+                    n_w = len(states)
+                    n_idle = sum(1 for s in states.values() if s == "idle")
+                    n_done = sum(1 for s in states.values() if s == "done")
+                    rows.append({"round": r.rid, "depth": depth,
+                                 "parent": parent,
+                                 "workers": n_w, "working": n_w - n_idle - n_done,
+                                 "idle": n_idle, "done_workers": n_done,
+                                 "done": bool(getattr(r, "done", True)),
+                                 "messages": len(getattr(r, "messages", []) or []),
+                                 "plan_version": getattr(r, "plan_version", 0)})
+                    for cid, c in (getattr(r, "children", None) or {}).items():
+                        walk(c, depth + 1, r.rid)
+                except Exception:
+                    pass
+
+            for r in (self._rounds or {}).values():
+                walk(r, 0, None)
+            if active_only:
+                rows = [x for x in rows if not x["done"]]
+            return {"success": True, "rounds": rows}
+        if name == "radio.read":
+            rid = str(params.get("round") or "")
+            rnd = self._find_round(rid)
+            if rnd is None:
+                known = sorted((self._rounds or {}).keys())
+                return {"success": False,
+                        "error": f"unknown round {rid!r}. Known top-level: {known}. "
+                                 f"Use radio.list first."}
+            try:
+                since = max(0, int(params.get("since_seq") or 0))
+            except Exception:
+                since = 0
+            try:
+                limit = max(1, min(50, int(params.get("limit") or 20)))
+            except Exception:
+                limit = 20
+            msgs = [m for m in (getattr(rnd, "messages", []) or [])
+                    if m.get("seq", 0) > since][-limit:]
+            out = {"success": True, "round": rnd.rid,
+                   "done": bool(getattr(rnd, "done", True)),
+                   "seq": getattr(rnd, "seq", 0), "messages": msgs,
+                   "states": dict(getattr(rnd, "states", {}) or {})}
+            if params.get("include_plan", True) is not False:
+                try:
+                    out["plan"] = rnd.snapshot_plan()
+                except Exception:
+                    out["plan"] = []
+            return out
+        if name == "radio.send":
+            rid = str(params.get("round") or "")
+            rnd = self._find_round(rid)
+            if rnd is None:
+                return {"success": False,
+                        "error": f"unknown round {rid!r}. Use radio.list first."}
+            res = rnd.say("leader", params.get("to", "all"),
+                          params.get("text", ""))
+            if res.get("success"):
+                res = dict(res, round=rnd.rid, **{"from": "leader"})
+            return res
+        return {"success": False, "error": f"unknown radio op {name!r}"}
+
+    async def _run_round_background(self, record: dict):
+        """Background completion: supervise, finalize, then hand the summary
+        to on_round_done (web: notify + synthesize). Never raises."""
+        rnd, tasks, ids, t0 = record["rnd"], record["tasks"], record["ids"], record["t0"]
+        try:
+            futs = [asyncio.ensure_future(self._run_worker(t, rnd, record.get("tree")))
+                    for t in tasks]
+            results = await self._supervise_round(rnd, futs, ids, t0)
+            out = self._finish_round(rnd, tasks, ids, results, t0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event("AGENT", f"background round {record['rid']} crashed: {e}", level="ERROR")
+            out = {"success": False, "round": record["rid"], "results": [],
+                   "error": str(e), "ok": 0, "failed": len(ids)}
+        finally:
+            record["done"] = True
+            self._bg_rounds.pop(record["rid"], None)
+        if not out.get("success"):
+            summary_note = (f"[ROUND {record['rid']} FAILED in background: {out.get('error', '?')}] "
+                            f"Tell the user plainly.")
+        else:
+            lines = []
+            for r in out.get("results", []):
+                mark = "OK" if r.get("success") else "FAIL"
+                lines.append(f"- {r.get('id')} [{mark}]: {_short(r.get('output') or r.get('error') or '(empty)', 800)}")
+            summary_note = (f"[ROUND {record['rid']} finished in background: "
+                            f"{out.get('ok', 0)} ok / {out.get('failed', 0)} failed "
+                            f"in {out.get('elapsed', 0):.0f}s]\n" + "\n".join(lines) +
+                            "\nReport these results to the user now.")
+        cb = self.on_round_done
+        if cb is not None:
+            try:
+                if asyncio.iscoroutinefunction(cb):
+                    await cb({"sid": self.sid, "summary": summary_note,
+                              "round": record["rid"], "ok": out.get("success", False)})
+                else:
+                    cb({"sid": self.sid, "summary": summary_note,
+                        "round": record["rid"], "ok": out.get("success", False)})
+            except Exception as e:
+                log_event("AGENT", f"on_round_done failed: {e}", level="ERROR")
+
+
+    async def _run_worker(self, task: dict, rnd: DelegateRound,
+                          tree: Optional[TreeBudget] = None) -> dict:
         wid = task.get("id", "t?")
         brief = task.get("brief", "")
-        self._emit("subagent_start", {"round": rnd.rid, "id": wid, "brief": brief})
+        color = task.get("color", "#D4AF37")
+        nest_on = bool(getattr(self, "recursive_mode", False))
+        self._emit("subagent_start", {"round": rnd.rid, "id": wid, "brief": brief,
+                                      "color": color, "depth": 1, "parent": None})
         log_event("SUBAGENT", f"start sid={self.sid} round={rnd.rid} id={wid} brief={_short(brief, 300)!r}")
         t0 = time.time()
         try:
             worker = NexusWorker(wid, brief, task.get("context", "") or "",
                                  self.sid, self.sm, self.llm, self.workspace,
-                                 rnd, self._emit)
+                                 rnd, self._emit, color,
+                                 depth=1, tree=tree, nest_on=nest_on,
+                                 allow_code_edit=task.get("code_edit") is True)
+            worker.stop_event = getattr(self, "stop_event", None)
             res = await worker.run()
         except Exception as e:
+            import traceback as _tb
+            log_event("SUBAGENT", f"worker {wid} CRASHED {type(e).__name__}: {e}\n"
+                                  f"{_tb.format_exc()[-2000:]}", level="ERROR")
             res = {"text": "", "tools_used": 0, "iterations": 0, "success": False,
-                   "error": str(e), "radio_seen": 0, "radio_sent": 0}
+                   "error": f"{type(e).__name__}: {e}", "radio_seen": 0, "radio_sent": 0}
         elapsed = round(time.time() - t0, 3)
         ok = bool(res.get("success", True)) and not res.get("error")
         log_event("SUBAGENT", f"done sid={self.sid} round={rnd.rid} id={wid} {'OK' if ok else 'FAIL'} "
@@ -1683,8 +2875,11 @@ class NexusWorker:
     def __init__(self, wid: str, brief: str, context: str, sid: str,
                  sm: SessionManager, llm: LLMProvider, workspace: str,
                  rnd: Optional[DelegateRound] = None,
-                 emit: Optional[Callable] = None):
+                 emit: Optional[Callable] = None, color: str = "#D4AF37",
+                 depth: int = 1, tree: Optional["TreeBudget"] = None,
+                 nest_on: bool = False, allow_code_edit: bool = False):
         self.wid = wid
+        self.color = color or "#D4AF37"
         self.brief = brief or ""
         self.sid = sid
         self.sm = sm
@@ -1692,11 +2887,17 @@ class NexusWorker:
         self.workspace = workspace
         self.rnd = rnd
         self.emit = emit or (lambda e, d: None)
+        self.depth = max(1, int(depth or 1))
+        self.tree = tree
+        self.nest_on = bool(nest_on)
+        self.allow_code_edit = bool(allow_code_edit)  # explicit per-task grant only
+        self._nest_seq = 0  # nested-round counter (sub-round ids)
         self.tools_used = 0
         self.radio_seen = 0
         self.radio_sent = 0
         self.last_seq = 0
         self.last_version = -1  # -1 forces the opening plan snapshot on step 1
+        self.stop_event = None  # set by web STOP button via the leader's agent
         peers = [w for w in (rnd.worker_ids if rnd else []) if w != wid]
         self.history: List[dict] = [
             {"role": "system", "content":
@@ -1704,6 +2905,8 @@ class NexusWorker:
                 "Be concise: your last message must be the self-contained result (facts, "
                 "numbers, file paths — everything the leader needs, since it never sees "
                 "your tool outputs directly). Do not ask questions. There is no delegation tool."
+                + (" " + worker_nest_guidance(self.depth)
+                   if self._nest_offered() else "")
                 + (f" You share round {rnd.rid} with peer worker(s) {peers}: coordinate with "
                      "agent.say (to='all' or a peer id — they read it before their next step) "
                      "and the joint agent.plan (add/claim/done/note/list). Claim a plan step "
@@ -1713,16 +2916,263 @@ class NexusWorker:
                      "2) if a peer addresses YOU by id on the radio, answer them directly (to=their id) "
                      "before you finish; 3) broadcast your key finding + plan done when finished. "
                      "A worker that never speaks is a failed worker. "
+                     "The leader reads this radio (any round, any depth) and may "
+                     "chime in as 'leader' — heed a leader message like a briefing update. "
                      "TOOL DISCIPLINE: match shell_type to your syntax (PowerShell code → pwsh; "
                      "cmd syntax → cmd.exe) — if stdout just echoes your command, switch shells "
                      "immediately. Prefer fast checks (ping -n 4, fetch timeout 20); never "
-                     "tracert -h 30; never re-fetch a URL that returned junk. STOP the moment "
-                     "your brief is fulfilled — report partial results instead of burning "
-                     "iterations."
-                   if rnd and peers else "")},
+                     "tracert -h 30; never re-fetch a URL that returned junk. STOP calling "
+                     "tools the moment your brief is fulfilled — report partial results "
+                     "instead of burning iterations. Stopping does NOT end you: the round "
+                     "rules, and while it is open radio addressed to you (or to all) or "
+                     "plan changes will wake you back to work, so keep watching."
+                   if rnd and peers else "")
+                + (" " + worker_codeedit_guidance(self.allow_code_edit))},
             {"role": "user", "content":
                 f"TASK {wid}: {brief}" + (f"\nCONTEXT: {context}" if context else "")},
         ]
+
+    def _nest_offered(self) -> bool:
+        """True when this worker is actually offered agent.delegate."""
+        return bool(self.nest_on and self.depth < CFG.recursive_max_depth)
+
+    def _nest_allowed(self) -> bool:
+        """Gate for an incoming agent.delegate call: mode on, depth headroom,
+        and tree budget left (claimed at spawn time inside _delegate_nested)."""
+        if not self._nest_offered():
+            return False
+        return self.tree is None or self.tree.room() > 0
+
+    def _tools(self) -> list:
+        """Dynamic tool list: delegate appears only when nesting is offered."""
+        if self._nest_offered():
+            return WORKER_TOOLS + [TOOL_SPEC_DELEGATE_NEST]
+        return WORKER_TOOLS
+
+    async def _delegate_nested(self, params: dict) -> dict:
+        """SYNC nested fan-out inside this worker (NEST MODE). Spawns
+        depth+1 children in their own sub-round with private radio/plan,
+        supervises to close, and returns their outputs as THIS tool call's
+        result for the worker to verify + fold into its own result."""
+        tasks = params.get("tasks", []) or []
+        if not isinstance(tasks, list) or not tasks:
+            return {"success": False,
+                    "error": "agent.delegate needs a non-empty 'tasks' list"}
+        err = _validate_delegate_tasks(tasks)
+        if err:
+            return {"success": False, "error": err}
+        # Log-found fix (Gatherer1-6 in 4 sub-rounds overwrote one body):
+        # names are session-unique — duplicates bounce with a fix hint.
+        dupes = self.tree.claim_names([x["id"] for x in tasks]) if self.tree else []
+        if dupes:
+            return {"success": False,
+                    "error": f"names {dupes} are already used by other workers this "
+                             f"session (one hologram body per name). Re-call with unique "
+                             f"names — e.g. prefix with your own id: '{self.wid}-G1'."}
+        wanted = [x["id"] for x in tasks]
+        cap = CFG.recursive_max_tasks
+        trunc = ""
+        if len(tasks) > cap:
+            tasks = tasks[:cap]
+            trunc = f" (truncated to the nested per-call cap of {cap})"
+        granted = self.tree.claim(len(tasks)) if self.tree else len(tasks)
+        if granted < len(tasks):
+            tasks = tasks[:granted]
+            trunc += (f" (tree budget: only {granted} spawned, "
+                      f"{self.tree.used}/{self.tree.limit} nested workers used)")
+        if not tasks:
+            return {"success": False,
+                    "error": "tree budget exhausted — no nested workers left; "
+                             "do the task with exec/web tools"}
+        # Chaining order: the worker MUST call again for the remainder unless
+        # the tree is dry (then it reports partials + the cap, honestly).
+        dropped = [i for i in wanted if i not in {x["id"] for x in tasks}]
+        if dropped and self.tree is not None:
+            # Free dropped names IN PLACE (shared session set) so the chained
+            # retry for the remainder passes the uniqueness gate.
+            drop_low = {str(i).lower() for i in dropped}
+            for n in [n for n in self.tree.names if str(n).lower() in drop_low]:
+                self.tree.names.discard(n)
+        if dropped:
+            if self.tree is not None and self.tree.room() <= 0:
+                trunc += (f" REMAINDER {dropped} CANNOT spawn (tree budget dry) — "
+                          f"report your partials and state the {self.tree.limit}-worker "
+                          f"tree cap plainly.")
+            else:
+                trunc += (f" REMAINDER NOT SPAWNED: {dropped} — call agent.delegate "
+                          f"AGAIN with exactly these remaining tasks (same brief rules).")
+        self._nest_seq += 1
+        base_rid = self.rnd.rid if self.rnd else "R?"
+        sub_rid = f"{base_rid}/{self.wid}#{self._nest_seq}"
+        sub = DelegateRound(sub_rid, [x["id"] for x in tasks])
+        sub.note_activity()
+        if self.rnd is not None:
+            try:
+                self.rnd.children[sub_rid] = sub
+            except Exception:
+                pass
+        try:
+            self.emit("delegate_start", {"round": sub_rid, "nested": True,
+                                         "parent": self.wid, "depth": self.depth + 1,
+                                         "count": len(tasks),
+                                         "ids": [x["id"] for x in tasks],
+                                         "colors": {x["id"]: x.get("color", "#D4AF37")
+                                                    for x in tasks}})
+        except Exception:
+            pass
+        log_event("AGENT", f"nested delegate start sid={self.sid} round={sub_rid} "
+                            f"parent={self.wid} depth={self.depth + 1} workers={[x['id'] for x in tasks]}")
+        t0 = time.time()
+        if self.rnd is not None:
+            self.rnd.nested_active = getattr(self.rnd, "nested_active", 0) + 1
+        try:
+            futs = [asyncio.ensure_future(self._run_child(x, sub)) for x in tasks]
+            results = await self._supervise_nested(sub, futs, [x["id"] for x in tasks], t0)
+        finally:
+            if self.rnd is not None:
+                self.rnd.nested_active = max(0, getattr(self.rnd, "nested_active", 1) - 1)
+        elapsed = round(time.time() - t0, 3)
+        n_ok = sum(1 for r in results if r.get("success"))
+        slim = [{k: r.get(k) for k in ("id", "brief", "output", "error", "success",
+                                       "tools_used", "elapsed")}
+                for r in results]
+        try:
+            self.sm.add_tool_call(self.sid, "agent.delegate",
+                                  {"nested": True, "parent": self.wid,
+                                   "tasks": [{k: x.get(k) for k in ("id", "brief")} for x in tasks]},
+                                  {"success": True, "round": sub_rid, "results": slim,
+                                   "elapsed": elapsed, "ok": n_ok,
+                                   "failed": len(results) - n_ok}, elapsed)
+        except Exception as e:
+            log_event("SAVE", f"nested delegate persist failed sid={self.sid}: {e}",
+                      level="ERROR")
+        log_event("AGENT", f"nested delegate done sid={self.sid} round={sub_rid} "
+                            f"ok={n_ok}/{len(results)} elapsed={elapsed:.1f}s")
+        try:
+            self.emit("delegate_done", {"round": sub_rid, "nested": True,
+                                        "parent": self.wid, "ok": n_ok,
+                                        "failed": len(results) - n_ok,
+                                        "elapsed": elapsed})
+        except Exception:
+            pass
+        head = (f"Nested round {sub_rid} finished: {n_ok} ok / "
+                f"{len(results) - n_ok} failed in {elapsed:.0f}s{trunc}. "
+                f"VERIFY each child against its OUTPUT contract, then fold them "
+                f"into YOUR result (I never see raw child output).")
+        lines = [f"- {r.get('id')} [{'OK' if r.get('success') else 'FAIL'}]: "
+                 f"{_short(r.get('output') or r.get('error') or '(empty)', 800)}"
+                 for r in results]
+        return {"success": True, "nested": True, "round": sub_rid,
+                "ok": n_ok, "failed": len(results) - n_ok,
+                "results": slim,
+                "note": head + "\n" + "\n".join(lines)}
+
+    async def _run_child(self, task: dict, sub: DelegateRound) -> dict:
+        """Spawn + run one nested child (depth+1), emitting depth/parent so
+        the hologram can nest its orbit. Mirrors NexusAgent._run_worker."""
+        wid = task.get("id", "t?")
+        brief = task.get("brief", "")
+        color = task.get("color", "#D4AF37")
+        try:
+            self.emit("subagent_start", {"round": sub.rid, "id": wid, "brief": brief,
+                                         "color": color, "depth": self.depth + 1,
+                                         "parent": self.wid})
+        except Exception:
+            pass
+        log_event("SUBAGENT", f"start sid={self.sid} round={sub.rid} id={wid} "
+                               f"depth={self.depth + 1} parent={self.wid} "
+                               f"brief={_short(brief, 300)!r}")
+        t0 = time.time()
+        try:
+            worker = NexusWorker(wid, brief, task.get("context", "") or "",
+                                 self.sid, self.sm, self.llm, self.workspace,
+                                 sub, self.emit, color,
+                                 depth=self.depth + 1, tree=self.tree,
+                                 nest_on=self.nest_on,
+                                 allow_code_edit=task.get("code_edit") is True)
+            worker.stop_event = getattr(self, "stop_event", None)
+            res = await worker.run()
+        except Exception as e:
+            import traceback as _tb
+            log_event("SUBAGENT", f"worker {wid} CRASHED {type(e).__name__}: {e}\n"
+                                  f"{_tb.format_exc()[-2000:]}", level="ERROR")
+            res = {"text": "", "tools_used": 0, "iterations": 0, "success": False,
+                   "error": f"{type(e).__name__}: {e}", "radio_seen": 0, "radio_sent": 0}
+        elapsed = round(time.time() - t0, 3)
+        ok = bool(res.get("success", True)) and not res.get("error")
+        log_event("SUBAGENT", f"done sid={self.sid} round={sub.rid} id={wid} "
+                               f"{'OK' if ok else 'FAIL'} elapsed={elapsed:.1f}s "
+                               f"tools={res.get('tools_used', 0)}")
+        try:
+            self.emit("subagent_done", {"round": sub.rid, "id": wid, "brief": brief,
+                                        "output": res.get("text", ""),
+                                        "success": ok, "elapsed": elapsed,
+                                        "tools_used": res.get("tools_used", 0),
+                                        "radio_seen": res.get("radio_seen", 0),
+                                        "radio_sent": res.get("radio_sent", 0),
+                                        "depth": self.depth + 1, "parent": self.wid})
+        except Exception:
+            pass
+        return {"id": wid, "brief": brief, "output": res.get("text", ""),
+                "error": res.get("error", ""), "success": ok,
+                "tools_used": res.get("tools_used", 0),
+                "radio_seen": res.get("radio_seen", 0),
+                "radio_sent": res.get("radio_sent", 0), "elapsed": elapsed}
+
+    async def _supervise_nested(self, sub: DelegateRound, futs: list,
+                                ids: list, t0: float) -> list:
+        """Nested supervisor: same round rules as top-level (idle+quiet close,
+        scaled timeout, grace+cancel), scoped to one sub-round. Never raises
+        past CancelledError."""
+        pending = set(futs)
+        grace_until = 0.0
+        timeout = scaled_round_timeout(len(ids))
+        try:
+            while pending:
+                if self._stopped():
+                    sub.close("stopped by user")
+                _done, pending = await asyncio.wait(pending, timeout=1.0)
+                if not pending:
+                    break
+                if sub.done:
+                    if grace_until and time.time() > grace_until:
+                        for f in list(pending):
+                            f.cancel()
+                    continue
+                try:
+                    states = [sub.states.get(wid, "done") for wid in ids]
+                    quiet_for = time.time() - sub.last_activity
+                    need = 0.0 if (sub.seq == 0 and sub.plan_version == 0) else CFG.round_quiet_sec
+                    if all(s in ("idle", "done") for s in states) and quiet_for >= need:
+                        sub.close(f"all idle + quiet {quiet_for:.0f}s")
+                        continue
+                    if time.time() - t0 > timeout and getattr(sub, "nested_active", 0) <= 0:
+                        sub.close(f"nested round timeout {timeout:.0f}s")
+                        grace_until = time.time() + 60
+                except Exception as e:
+                    log_event("AGENT", f"nested supervisor tick failed: {e}",
+                              level="WARNING")
+        finally:
+            sub.close("nested delegate settled")
+            for f in pending:
+                f.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+        results = []
+        for wid, f in zip(ids, futs):
+            try:
+                results.append(f.result())
+            except asyncio.CancelledError:
+                results.append({"id": wid, "brief": "", "output": "",
+                                "error": "cancelled", "success": False,
+                                "tools_used": 0, "radio_seen": 0,
+                                "radio_sent": 0, "elapsed": 0})
+            except Exception as e:
+                results.append({"id": wid, "brief": "", "output": "",
+                                "error": f"worker crashed: {e}", "success": False,
+                                "tools_used": 0, "radio_seen": 0,
+                                "radio_sent": 0, "elapsed": 0})
+        return results
 
     def _drain_radio(self):
         """Pull new round traffic into history before the next LLM call."""
@@ -1738,93 +3188,240 @@ class NexusWorker:
                            + self.rnd.format_traffic(msgs, plan),
             })
 
+    def _stopped(self) -> bool:
+        try:
+            ev = getattr(self, "stop_event", None)
+            return bool(ev is not None and ev.is_set())
+        except Exception:
+            return False
+
+    async def _linger(self) -> bool:
+        """Idle (not exit) while the round is open. Wakes on radio addressed
+        to me (`to=<wid>`) or broadcast (`to=all`), or on any plan change.
+        Returns True if woken with news, False if the round closed (exit for
+        good) or the linger failsafe fired. Never raises."""
+        rnd = self.rnd
+        if rnd is None or rnd.done:
+            return False
+        rnd.set_state(self.wid, "idle")
+        log_event("SUBAGENT", f"id={self.wid} sid={self.sid} idle — lingering for round traffic")
+        try:
+            self.emit("idle", {"round": rnd.rid, "id": self.wid})
+        except Exception:
+            pass
+        start = time.time()
+        try:
+            while not rnd.done and not self._stopped():
+                if time.time() - start > CFG.worker_linger_sec:
+                    log_event("SUBAGENT", f"id={self.wid} linger failsafe "
+                                          f"({CFG.worker_linger_sec:.0f}s) — exiting",
+                              level="WARNING")
+                    return False
+                await asyncio.sleep(0.5)
+                try:
+                    msgs, plan, seq, ver = rnd.drain(self.last_seq, self.last_version)
+                except Exception:
+                    continue
+                norm = lambda s: " ".join(str(s or "").split()).lower()
+                news = [m for m in (msgs or [])
+                        if norm(m.get("to")) in (norm(self.wid), "all")]
+                if news or plan is not None:
+                    self.last_seq, self.last_version = seq, ver
+                    try:
+                        self.radio_seen += sum(1 for m in news if m.get("from") != self.wid)
+                    except Exception:
+                        pass
+                    self.history.append({
+                        "role": "user",
+                        "content": f"📻 ROUND {rnd.rid} update (the round is still open and this "
+                                   f"needs you — address it with tools, then continue):\n"
+                                   + rnd.format_traffic(news, plan),
+                    })
+                    try:
+                        self.sm.add_message(self.sid, "user",
+                                            f"[round {rnd.rid} radio -> {self.wid}: waking]")
+                    except Exception:
+                        pass
+                    log_event("SUBAGENT", f"id={self.wid} WOKE on {len(news)} msg(s) "
+                                          f"plan={'yes' if plan is not None else 'no'}")
+                    try:
+                        self.emit("wake", {"round": rnd.rid, "id": self.wid,
+                                           "msgs": len(news)})
+                    except Exception:
+                        pass
+                    return True
+                self.last_seq, self.last_version = seq, ver
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log_event("SUBAGENT", f"id={self.wid} linger crashed: {e} — exiting",
+                      level="ERROR")
+            return False
+        return False
+
     async def run(self) -> dict:
         iterations = 0
         text = ""
+        updates = 0
+        finished_early = False
+        closed_by_round = False
         # Refuse empty briefs instantly: no LLM calls wasted on hallucinated meta-work.
         if not self.brief.strip():
             return {"text": "", "tools_used": 0, "iterations": 0, "success": False,
                     "error": "empty brief — leader must supply a self-contained task",
                     "radio_seen": 0}
-        for i in range(CFG.subagent_max_iterations):
-            iterations = i + 1
-            self._drain_radio()
-            out = await self.llm.chat(self.history, tools=WORKER_TOOLS)
-            content = out.get("content", "") or ""
-            calls = out.get("tool_calls", []) or []
-            if out.get("thinking"):
-                self.emit("thinking", {"who": self.wid, "text": out["thinking"],
-                                       "round": self.rnd.rid if self.rnd else ""})
-            if not calls:
-                text = content
-                self.history.append({"role": "assistant", "content": content})
-                break
-            self.history.append({"role": "assistant", "content": content, "tool_calls": calls})
+        if self.rnd:
+            self.rnd.set_state(self.wid, "working")
+        try:
+            for i in range(CFG.subagent_max_iterations):
+                iterations = i + 1
+                if self._stopped():
+                    log_event("SUBAGENT", f"id={self.wid} stopped by user")
+                    finished_early = True
+                    break
+                if self.rnd:
+                    if self.rnd.done:
+                        closed_by_round = True
+                        break
+                    self.rnd.set_state(self.wid, "working")
+                self._drain_radio()
+                out = await self.llm.chat(self.history, tools=self._tools())
+                if isinstance(out, str):
+                    log_event("SUBAGENT", f"id={self.wid} LLM returned bare str — wrapped",
+                              level="WARNING")
+                    out = {"content": out, "tool_calls": []}
+                content = out.get("content", "") or ""
+                calls = out.get("tool_calls", []) or []
+                if any(not isinstance(c, dict) for c in calls):
+                    log_event("SUBAGENT", f"id={self.wid} dropped non-dict tool call(s)",
+                              level="WARNING")
+                    calls = [c for c in calls if isinstance(c, dict)]
+                if not calls:
+                    content, calls = _adopt_text_calls(
+                        content, self._tools(), "worker", self.sid)
+                if out.get("thinking"):
+                    self.emit("thinking", {"who": self.wid, "text": out["thinking"],
+                                           "round": self.rnd.rid if self.rnd else ""})
+                if not calls:
+                    # Own task finished -> IDLE, never a permanent exit while
+                    # the round is open. Later finishes APPEND (round updates)
+                    # so the first real result is never overwritten by an ack.
+                    if content.strip():
+                        if text and content.strip() != text.strip():
+                            updates += 1
+                            text = text + f"\n\n[round update {updates}]: {content.strip()}"
+                        elif not text:
+                            text = content
+                    self.history.append({"role": "assistant", "content": content})
+                    if self.rnd is None or self.rnd.done:
+                        finished_early = True
+                        break
+                    if await self._linger():
+                        continue  # woken by radio/plan -> another step
+                    finished_early = True
+                    break  # round closed (or failsafe) -> exit for good
+                self.history.append({"role": "assistant", "content": content, "tool_calls": calls})
 
-            async def _one(tc):
-                params = (json.loads(tc["arguments"])
-                          if isinstance(tc["arguments"], str) else (tc["arguments"] or {}))
-                name = tc.get("name", "")
-                rid = self.rnd.rid if self.rnd else ""
-                t0 = time.time()
-                self.emit("wtool_start", {"call_id": tc.get("id"), "round": rid,
-                                          "who": self.wid, "name": name, "params": params})
-                if name == "agent.delegate":
-                    # Depth guard: workers cannot spawn workers.
-                    res = {"success": False, "error": "workers cannot delegate; do the task with exec/web tools"}
-                elif name == "agent.say" and self.rnd:
-                    res = self.rnd.say(self.wid, params.get("to", "all"), params.get("text", ""))
-                    if res.get("success"):
-                        self.radio_sent += 1
-                        self.emit("radio", {"round": self.rnd.rid, "seq": res["seq"],
-                                            "from": self.wid, "to": params.get("to", "all") or "all",
-                                            "text": params.get("text", "")})
-                elif name == "agent.plan" and self.rnd:
-                    res = self.rnd.plan_op(self.wid, params.get("action", "list"),
-                                           params.get("step_id", ""), params.get("title", ""),
-                                           params.get("note", ""))
-                    if res.get("success") and (params.get("action", "list") != "list"):
-                        self.emit("plan", {"round": self.rnd.rid, "by": self.wid,
-                                           "action": params.get("action", ""),
-                                           "step": res.get("step", params.get("step_id", "")),
-                                           "plan": res.get("plan", []),
-                                           "version": res.get("version", 0)})
-                elif name in ("agent.say", "agent.plan"):
-                    res = {"success": False, "error": "no active round"}
+                async def _one(tc):
+                    params = (json.loads(tc["arguments"])
+                              if isinstance(tc["arguments"], str) else (tc["arguments"] or {}))
+                    name = tc.get("name", "")
+                    rid = self.rnd.rid if self.rnd else ""
+                    t0 = time.time()
+                    self.emit("wtool_start", {"call_id": tc.get("id"), "round": rid,
+                                              "who": self.wid, "name": name, "params": params})
+                    if name == "agent.delegate":
+                        if self._nest_allowed():
+                            res = await self._delegate_nested(params)
+                        else:
+                            why = (f"at max nesting depth {CFG.recursive_max_depth}")
+                            if not self.nest_on:
+                                why = ("RECURSIVE MODE is OFF for this session — flip the "
+                                       "NEST toggle (or /recursive on) to allow workers "
+                                       "that spawn sub-workers")
+                            res = {"success": False,
+                                   "error": f"workers cannot delegate ({why}); "
+                                            f"do the task with exec/web tools"}
+                    elif name in ("radio.list", "radio.read", "radio.send"):
+                        res = {"success": False,
+                               "error": "leader-only radio tools — workers use agent.say / "
+                                        "agent.plan inside their own round"}
+                    elif name == "agent.say" and self.rnd:
+                        res = self.rnd.say(self.wid, params.get("to", "all"), params.get("text", ""))
+                        if res.get("success"):
+                            self.radio_sent += 1
+                            self.emit("radio", {"round": self.rnd.rid, "seq": res["seq"],
+                                                "from": self.wid, "to": params.get("to", "all") or "all",
+                                                "text": params.get("text", "")})
+                    elif name == "agent.plan" and self.rnd:
+                        res = self.rnd.plan_op(self.wid, params.get("action", "list"),
+                                               params.get("step_id", ""), params.get("title", ""),
+                                               params.get("note", ""))
+                        if res.get("success") and (params.get("action", "list") != "list"):
+                            self.emit("plan", {"round": self.rnd.rid, "by": self.wid,
+                                               "action": params.get("action", ""),
+                                               "step": res.get("step", params.get("step_id", "")),
+                                               "plan": res.get("plan", []),
+                                               "version": res.get("version", 0)})
+                    elif name in ("agent.say", "agent.plan"):
+                        res = {"success": False, "error": "no active round"}
+                    else:
+                        res = await execute_tool(name, params, self.workspace,
+                                                 allow_code_edit=self.allow_code_edit,
+                                                 actor=f"worker {self.wid}")
+                    self.emit("wtool_result", {"call_id": tc.get("id"), "round": rid,
+                                               "who": self.wid, "name": name, "params": params,
+                                               "result": res, "elapsed": round(time.time() - t0, 3)})
+                    return tc, params, res
+
+                if len(calls) == 1:
+                        gathered = [await _one(calls[0])]
                 else:
-                    res = await execute_tool(name, params, self.workspace)
-                self.emit("wtool_result", {"call_id": tc.get("id"), "round": rid,
-                                           "who": self.wid, "name": name, "params": params,
-                                           "result": res, "elapsed": round(time.time() - t0, 3)})
-                return tc, params, res
-
-            if len(calls) == 1:
-                gathered = [await _one(calls[0])]
-            else:
-                gathered = await asyncio.gather(*[_one(tc) for tc in calls])
-            for tc, params, res in gathered:
-                self.tools_used += 1
-                self.history.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": json.dumps(res, ensure_ascii=False)[:20000],
-                })
-        else:
+                        gathered = await asyncio.gather(*[_one(tc) for tc in calls])
+                for tc, params, res in gathered:
+                    self.tools_used += 1
+                    self.history.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "content": json.dumps(res, ensure_ascii=False)[:20000],
+                    })
+        finally:
+            if self.rnd:
+                self.rnd.set_state(self.wid, "done")
+        round_cut = closed_by_round and not finished_early and not text
+        if round_cut:
+            # Log-found fix: the supervisor closed the round under this worker
+            # (timeout/quiet) — it did NOT exhaust any budget. Report honestly
+            # instead of the old "(budget exhausted...)" lie.
+            log_event("SUBAGENT", f"id={self.wid} sid={self.sid} round closed under it "
+                                  f"after {iterations} iterations with no output",
+                      level="WARNING")
+        elif not finished_early and not closed_by_round:
             log_event("SUBAGENT", f"id={self.wid} sid={self.sid} hit iteration budget "
                                   f"({CFG.subagent_max_iterations})", level="WARNING")
+        if self._stopped() and not text:
+            text = "(stopped by user before producing output)"
         if _is_error_content(text):
             # Model endpoint failed: report failure so the leader knows this
             # output is unusable (never pass raw error text up as a result).
+            billing = _is_billing_error(text)
             return {"text": "", "tools_used": self.tools_used,
                     "iterations": iterations, "success": False,
-                    "error": "model endpoint temporarily failing (retry delegation)",
+                    "error": ("model billing refusal 402 (switch to a free model)"
+                              if billing else
+                              "model endpoint temporarily failing (retry delegation)"),
                     "radio_seen": self.radio_seen, "radio_sent": self.radio_sent}
         if not text:
-            # Ended on tool calls (budget hit): summarize what was gathered.
-            text = f"(budget exhausted after {iterations} iterations, {self.tools_used} tool calls; " \
-                   f"partial trace in nexus.log)"
+            # Ended with no output: say WHY (round cut vs true exhaustion).
+            if round_cut:
+                text = (f"(round closed by supervisor after {iterations} iterations "
+                        f"before producing output; partial trace in nexus.log)")
+            else:
+                text = f"(budget exhausted after {iterations} iterations, {self.tools_used} tool calls; " \
+                       f"partial trace in nexus.log)"
             success = False
         else:
+            # A round-cut worker that DID produce text keeps its result.
             success = True
         return {"text": text, "tools_used": self.tools_used,
                 "iterations": iterations, "success": success,
@@ -1850,11 +3447,18 @@ SLASH_COMMANDS = [
     {"cmd": "/key", "usage": "/key <sk-...>", "desc": "Set OpenAI-compatible API key (masked, saved to .env)"},
     {"cmd": "/ollama-host", "usage": "/ollama-host <url>", "desc": "Show/set Ollama host URL"},
     {"cmd": "/thinking", "usage": "/thinking [low|medium|high]", "desc": "Show/set reasoning effort"},
+    {"cmd": "/recursive", "usage": "/recursive [on|off]", "desc": "NEST MODE: let workers spawn sub-workers"},
+    {"cmd": "/layout", "usage": "/layout [flow|lattice|toggle]", "desc": "Hologram layout: flow scatter or lattice sphere-grid"},
     {"cmd": "/memory", "usage": "/memory", "desc": "Show what NEXUS remembers about you"},
     {"cmd": "/evolve", "usage": "/evolve [history|rollback N|why vNNN|revalidate]", "desc": "Run self-evolution cycle / versions"},
     {"cmd": "/clear", "usage": "/clear", "desc": "Clear the screen (local)"},
     {"cmd": "/help", "usage": "/help", "desc": "This list"},
 ]
+
+# Hologram layout law (frontend visual): "flow" (computed-map scatter around
+# the caller) or "lattice" (imaginary sphere-grid around the caller).
+# /layout flips it; web clients apply it via Entity3D.setLayoutMode.
+LAYOUT_MODE = "flow"
 
 
 def update_env_file(key: str, value: str):
@@ -2035,6 +3639,50 @@ async def handle_slash(text: str, ctx: dict) -> dict:
         sid: str = (ctx or {}).get("sid", "") or ""
         if cmd in ("/new", "/sessions", "/open", "/delete", "/evolve") and sm is None:
             return {"handled": True, "reply": "Session store unavailable.", "action": None}
+
+        if cmd == "/recursive":
+            # Per-session NEST MODE, applied by the caller (TUI/web) which owns
+            # the agent: explicit on/off only (this layer cannot see the flag).
+            want = (arg or "").lower().strip()
+            if want not in ("on", "off"):
+                return {"handled": True,
+                        "reply": "Usage: `/recursive on|off` — NEST MODE: workers "
+                                 "may spawn their own sub-workers.",
+                        "action": None}
+            enabled = want == "on"
+            log_event("TUI", f"slash /recursive -> {'on' if enabled else 'off'}")
+            state = "ON (workers may spawn sub-workers)" if enabled else "OFF"
+            return {"handled": True,
+                    "reply": f"RECURSIVE MODE → **{state}**.",
+                    "action": "recursive", "enabled": enabled, "sid": sid}
+
+        if cmd == "/layout":
+            # Hologram layout law (pure frontend visual): flow = computed-map
+            # scatter around the caller, lattice = imaginary sphere-grid
+            # around the caller. Applied by the caller (TUI/web) via
+            # Entity3D.setLayoutMode; the web UI persists it per browser.
+            global LAYOUT_MODE
+            want = (arg or "").lower().strip()
+            if want in ("lattice", "grid", "sphere"):
+                mode = "lattice"
+            elif want in ("flow", "map", "scatter"):
+                mode = "flow"
+            elif want in ("toggle", "switch", "flip"):
+                mode = "flow" if LAYOUT_MODE == "lattice" else "lattice"
+            else:
+                return {"handled": True,
+                        "reply": f"LAYOUT is **{LAYOUT_MODE.upper()}**. "
+                                 f"Usage: `/layout flow|lattice|toggle` — flow = scatter "
+                                 f"around the caller, lattice = sphere-grid around the caller.",
+                        "action": None}
+            LAYOUT_MODE = mode
+            log_event("TUI", f"slash /layout -> {mode}")
+            fancy = ("LATTICE (sphere-grid around the caller — crystal spheres, "
+                     "random slots)") if mode == "lattice" else \
+                    ("FLOW (computed-map scatter around the caller)")
+            return {"handled": True,
+                    "reply": f"LAYOUT → **{fancy}**.",
+                    "action": "layout", "mode": mode, "sid": sid}
 
         if cmd == "/new":
             try:
@@ -2825,6 +4473,10 @@ class NexusTUI(App):
                     self._render_plan()
             step = f" {data.get('step', '')}" if data.get("step") else ""
             self._agents_line(f"📋 {data['by']} {data.get('action', '')}{step} (plan v{data.get('version', 0)})")
+        elif event == "idle":
+            self._agents_line(f"◌ {data.get('id', '?')} idle — lingering for round traffic")
+        elif event == "wake":
+            self._agents_line(f"◉ {data.get('id', '?')} woke on {data.get('msgs', 0)} msg(s)")
         elif event == "delegate_done":
             rid = data.get("round", "?")
             if rid in self.round_plans:
@@ -2861,6 +4513,11 @@ class NexusTUI(App):
                     self._log_system(f"Opened {res['sid']} ({n} messages restored)")
                 elif action == "clear":
                     log.clear()
+                elif action == "recursive":
+                    try:
+                        self.agent.recursive_mode = bool(res.get("enabled"))
+                    except Exception:
+                        pass
                 if res.get("reply"):
                     log.write(Panel(Markdown(res["reply"]), title="CMD",
                                     subtitle=text.split()[0], border_style="amber"))

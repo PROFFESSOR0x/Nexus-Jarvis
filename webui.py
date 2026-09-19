@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import psutil
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -162,6 +162,15 @@ def system_snapshot(prev: Optional[dict]) -> tuple:
 
 class ChatIn(BaseModel):
     message: str
+    sid: str = ""
+
+
+class SidIn(BaseModel):
+    sid: str = ""
+
+
+class SessionNewIn(BaseModel):
+    title: str = "web"
 
 
 def build_app(session_id: Optional[str] = None) -> FastAPI:
@@ -175,26 +184,71 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
             raise ValueError("new")
     except Exception:
         sid = sm.create("web")
-    agent = NexusAgent(sid, sm, LLMProvider())
     hub = Hub()
-    agent.add_listener(hub.listener)
 
-    def make_agent(sid_):
+    def make_agent(sid_, stop_ev):
         ag = NexusAgent(sid_, sm, LLMProvider())
-        ag.add_listener(hub.listener)
+        ag.stop_event = stop_ev
+        tag = sid_
+        ag.add_listener(lambda e, d, _s=tag: hub.listener(e, {**(d or {}), "sid": _s}))
         return ag
 
+    async def _on_round_done(summary: dict):
+        """Background round closed: notify + auto-synthesize if idle, else pend.
+        The next/ongoing turn drains pending notes into the leader. Never raises."""
+        try:
+            sid_ = summary.get("sid", "")
+            rec2 = app.state.sessions.get(sid_)
+            if rec2 is None:
+                return
+            note = summary.get("summary", "") or ""
+            if note:
+                rec2["agent"].pending_round_notes.append(note)
+            hub.listener("round_done", {"sid": sid_, "round": summary.get("round"),
+                                        "ok": summary.get("ok"),
+                                        "summary": note[:600]})
+            if rec2["lock"].locked():
+                return  # busy: current/next turn drains the notes
+            async with rec2["lock"]:
+                if not rec2["agent"].pending_round_notes:
+                    return  # a turn that started meanwhile already drained them
+                rec2["stop"].clear()
+                try:
+                    await rec2["agent"].run("[background] A background round finished — "
+                                            "synthesize its results and report to the user now.")
+                except Exception as e:
+                    log_event("SYSTEM", f"auto-synthesis EXCEPTION sid={sid_}: {e}",
+                              level="ERROR")
+        except Exception as e:
+            log_event("SYSTEM", f"on_round_done EXCEPTION: {e}", level="ERROR")
+
+    def get_record(sid_) -> dict:
+        """Per-session runtime: agent + lock + message queue + stop flag.
+        Validates the session exists (404 otherwise). Never raises otherwise."""
+        try:
+            sm.load(sid_)
+        except Exception:
+            raise HTTPException(404, f"unknown session {sid_}")
+        rec = app.state.sessions.get(sid_)
+        if not rec:
+            stop_ev = asyncio.Event()
+            rec = {"agent": make_agent(sid_, stop_ev), "lock": asyncio.Lock(),
+                   "queue": [], "stop": stop_ev}
+            rec["agent"].on_round_done = _on_round_done
+            app.state.sessions[sid_] = rec
+        return rec
+
     app.state.sm = sm
-    app.state.sid = sid
-    app.state.agent = agent
+    app.state.sid = sid  # ACTIVE (focused) session for hologram + state
+    app.state.sessions = {}
     app.state.hub = hub
-    app.state.lock = asyncio.Lock()
     app.state.t0 = time.time()
     app.state.last_sys = None
     app.state.net_prev = None
+    get_record(sid)
 
-    def state_snapshot() -> dict:
-        csid = app.state.sid
+    def state_snapshot(sid_=None) -> dict:
+        csid = sid_ or app.state.sid
         # model/effort read live from CFG so /model /thinking /provider reflect instantly
         model = CFG.ollama_model if CFG.provider == "ollama" else CFG.model
         try:
@@ -203,6 +257,12 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
             n_tools = len(meta.get("tool_calls", []))
         except Exception:
             n_msg, n_tools = 0, 0
+        try:
+            rec = app.state.sessions.get(csid) or {}
+            busy = bool(rec.get("lock") and rec["lock"].locked())
+            queued = len(rec.get("queue", []))
+        except Exception:
+            busy, queued = False, 0
         return {
             "sid": csid,
             "provider": CFG.provider,
@@ -212,10 +272,13 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
             "ollama_host": CFG.ollama_host,
             "platform": f"{platform.system()} {platform.release()}",
             "uptime": round(time.time() - app.state.t0),
-            "busy": app.state.lock.locked(),
+            "busy": busy,
+            "queued": queued,
             "messages": n_msg,
             "tool_calls": n_tools,
             "workspace": str(sm.workspace(csid)),
+            "recursive": bool(getattr((app.state.sessions.get(csid) or {}).get("agent"),
+                                      "recursive_mode", False)),
         }
 
     @app.on_event("startup")
@@ -240,8 +303,41 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
                 pass
 
     @app.get("/api/state")
-    async def api_state():
-        return state_snapshot()
+    async def api_state(sid: str = ""):
+        return state_snapshot((sid or "").strip() or None)
+
+    @app.get("/api/deck")
+    async def api_deck(sid: str = ""):
+        """Authoritative deck truth: running rounds + per-worker states + busy.
+
+        The UI reconciles stuck visuals (working/thinking…) against this —
+        anything the backend already finished gets settled locally."""
+        tsid = (sid or "").strip() or app.state.sid
+        try:
+            sm.load(tsid)
+        except Exception:
+            raise HTTPException(404, f"unknown session {tsid}")
+        rec = app.state.sessions.get(tsid)
+        if not rec:
+            return {"sid": tsid, "busy": False, "running": {}}
+        try:
+            busy = bool(rec.get("lock") and rec["lock"].locked())
+        except Exception:
+            busy = False
+        running: Dict[str, Any] = {}
+        try:
+            ag = rec.get("agent")
+            for rid, record in (getattr(ag, "_bg_rounds", {}) or {}).items():
+                rnd = (record or {}).get("rnd")
+                try:
+                    states = dict(getattr(rnd, "states", {}) or {})
+                except Exception:
+                    states = {}
+                running[rid] = {"workers": states,
+                                "done": bool(getattr(rnd, "done", False))}
+        except Exception as e:
+            log_event("SYSTEM", f"deck EXCEPTION sid={tsid}: {e}", level="ERROR")
+        return {"sid": tsid, "busy": busy, "running": running}
 
     @app.get("/api/system")
     async def api_system():
@@ -300,11 +396,12 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
         }
 
     @app.post("/api/upload")
-    async def api_upload(files: List[UploadFile] = File(...)):
-        """Button + drag-and-drop uploads. Saved into THIS session's workspace
-        (its own folder; agents are not confined to it). Agent is told next turn."""
-        sid = app.state.sid  # always current (switch-safe; closure would go stale)
-        ws = sm.workspace(sid)
+    async def api_upload(files: List[UploadFile] = File(...), sid: str = Form("")):
+        """Button + drag-and-drop uploads. Saved into the target session's
+        workspace (its own folder; agents are not confined to it)."""
+        tsid = (sid or "").strip() or app.state.sid
+        rec = get_record(tsid)
+        ws = sm.workspace(tsid)
         try:
             ws.mkdir(parents=True, exist_ok=True)
         except Exception as e:
@@ -330,8 +427,7 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
                 saved.append({"name": dest.name, "size": size,
                               "path": str(dest.relative_to(ws))})
                 try:
-                    # current agent (not the boot-time closure): pending note drains next turn
-                    app.state.agent.pending_files.append({"name": dest.name, "size": size})
+                    rec["agent"].pending_files.append({"name": dest.name, "size": size})
                 except Exception:
                     pass
             except Exception as e:
@@ -341,9 +437,9 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
                     await f.close()
                 except Exception:
                     pass
-        log_event("SAVE", f"upload sid={sid} saved={len(saved)} errors={len(errors)} "
+        log_event("SAVE", f"upload sid={tsid} saved={len(saved)} errors={len(errors)} "
                           f"files={[s['name'] for s in saved]}")
-        hub.listener("upload", {"sid": sid, "workspace": str(ws),
+        hub.listener("upload", {"sid": tsid, "workspace": str(ws),
                                 "saved": saved, "errors": errors})
         return {"saved": saved, "errors": errors, "workspace": str(ws)}
 
@@ -363,47 +459,133 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
         except Exception as e:
             raise HTTPException(500, str(e))
 
+    @app.post("/api/session/new")
+    async def api_session_new(body: SessionNewIn):
+        """Create a session + runtime for an extra floating chat window."""
+        nsid = sm.create((body.title or "web").strip()[:40] or "web")
+        get_record(nsid)
+        log_event("SYSTEM", f"web session new sid={nsid}")
+        return {"sid": nsid, "state": state_snapshot(nsid)}
+
+    class RecursiveIn(BaseModel):
+        sid: str = ""
+        enabled: bool = False
+
+    @app.post("/api/recursive")
+    async def api_recursive(body: RecursiveIn):
+        """NEST MODE toggle: allow this session's workers to spawn sub-workers."""
+        nsid = (body.sid or "").strip() or app.state.sid
+        rec = get_record(nsid)  # 404 if unknown
+        rec["agent"].recursive_mode = bool(body.enabled)
+        try:
+            from main import log_event as _le
+            _le("SYSTEM", f"recursive mode {'ON' if body.enabled else 'OFF'} sid={nsid}")
+        except Exception:
+            pass
+        return {"sid": nsid, "recursive": bool(body.enabled)}
+
+    @app.post("/api/focus")
+    async def api_focus(body: SidIn):
+        """Focus a session: hologram + state follow it."""
+        nsid = (body.sid or "").strip()
+        get_record(nsid)  # 404 if unknown
+        app.state.sid = nsid
+        return state_snapshot(nsid)
+
+    @app.post("/api/stop")
+    async def api_stop(body: SidIn):
+        """STOP button: halt the running turn (cooperative: finishes the
+        current model call, then stops) and drop queued messages."""
+        nsid = (body.sid or "").strip() or app.state.sid
+        try:
+            sm.load(nsid)
+        except Exception:
+            raise HTTPException(404, f"unknown session {nsid}")
+        rec = app.state.sessions.get(nsid)
+        if not rec or not rec["lock"].locked():
+            return {"stopped": False, "sid": nsid, "reason": "idle"}
+        rec["stop"].set()
+        n = len(rec["queue"])
+        rec["queue"].clear()
+        log_event("SYSTEM", f"web stop sid={nsid} cleared={n}")
+        hub.listener("stop", {"sid": nsid, "cleared": n})
+        return {"stopped": True, "sid": nsid, "cleared": n}
+
     @app.post("/api/chat")
     async def api_chat(body: ChatIn):
-        nonlocal sid, agent
         msg = (body.message or "").strip()
         if not msg:
             raise HTTPException(400, "empty message")
+        # target session: explicit per-window sid, else the focused one
+        tsid = (body.sid or "").strip() or app.state.sid
         if msg.startswith("/"):
-            res = await nexus.handle_slash(msg, {"sm": sm, "sid": sid})
+            # slash commands resolve instantly (never queued, never blocked)
+            res = await nexus.handle_slash(msg, {"sm": sm, "sid": tsid})
             action = res.get("action")
             if action == "new":
-                # handle_slash already created the session — attach to it
-                # (creating a second one here orphaned an empty session).
-                nsid = res.get("sid")
-                if nsid:
-                    sid = nsid
-                else:
-                    sid = sm.create("web")
-                agent = make_agent(sid)
-                app.state.sid, app.state.agent = sid, agent
-                hub.listener("session", {"sid": sid})
+                # handle_slash already created the session — bind a runtime.
+                # The CALLING window rebinds itself (returned sid); other
+                # windows are untouched. No hub session event (no races).
+                nsid = res.get("sid") or sm.create("web")
+                get_record(nsid)
+                return {"final": res.get("reply") or "(done)", "slash": True,
+                        "action": action, "sid": nsid}
             elif action == "switch":
-                sid = res["sid"]
-                agent = make_agent(sid)
-                n = agent.restore_history()
-                app.state.sid, app.state.agent = sid, agent
-                hub.listener("session", {"sid": sid, "restored": n})
+                nsid = res["sid"]
+                rec = get_record(nsid)
+                n = rec["agent"].restore_history()
                 res["reply"] = (res.get("reply") or "") + f"\n({n} messages restored)"
+                return {"final": res.get("reply") or "(done)", "slash": True,
+                        "action": action, "sid": nsid}
             elif action == "clear":
-                return {"final": res.get("reply") or "", "slash": True, "action": "clear"}
+                return {"final": res.get("reply") or "", "slash": True,
+                        "action": "clear", "sid": tsid}
+            elif action == "recursive":
+                rec = get_record(tsid)
+                rec["agent"].recursive_mode = bool(res.get("enabled"))
+                return {"final": res.get("reply") or "(done)", "slash": True,
+                        "action": "recursive", "sid": tsid,
+                        "recursive": rec["agent"].recursive_mode}
+            elif action == "layout":
+                # pure frontend visual: the hologram switches law + persists it
+                return {"final": res.get("reply") or "(done)", "slash": True,
+                        "action": "layout", "sid": tsid,
+                        "layout": res.get("mode") or "flow"}
             return {"final": res.get("reply") or "(done)", "slash": True,
-                    "action": action}
-        if app.state.lock.locked():
-            raise HTTPException(409, "agent is busy with another turn")
-        async with app.state.lock:
-            hub.listener("user", {"text": msg})
+                    "action": action, "sid": tsid}
+        rec = get_record(tsid)
+        if rec["lock"].locked():
+            # busy: QUEUE instead of 409 — runs automatically after this turn
+            if len(rec["queue"]) >= 25:
+                raise HTTPException(429, "message queue full (25) — wait or STOP")
+            rec["queue"].append(msg)
+            hub.listener("queued", {"sid": tsid, "text": msg,
+                                    "position": len(rec["queue"])})
+            return {"queued": True, "position": len(rec["queue"]), "sid": tsid}
+        agent = rec["agent"]
+        async with rec["lock"]:
+            rec["stop"].clear()
+            hub.listener("user", {"text": msg, "sid": tsid})
             try:
                 final = await agent.run(msg)
             except Exception as e:
-                log_event("SYSTEM", f"web chat EXCEPTION: {e}", level="ERROR")
+                log_event("SYSTEM", f"web chat EXCEPTION sid={tsid}: {e}", level="ERROR")
                 raise HTTPException(500, str(e))
-            return {"final": final}
+            # drain the queue sequentially as follow-up turns (each announces
+            # itself over WS with user/final events for its own window)
+            while rec["queue"]:
+                if rec["stop"].is_set():
+                    rec["queue"].clear()
+                    break
+                nxt = rec["queue"].pop(0)
+                hub.listener("user", {"text": nxt, "sid": tsid})
+                try:
+                    await agent.run(nxt)
+                except Exception as e:
+                    log_event("SYSTEM", f"web drain EXCEPTION sid={tsid}: {e}",
+                              level="ERROR")
+                    break
+            return {"final": final, "sid": tsid}
 
     @app.websocket("/ws")
     async def ws(ws: WebSocket):
@@ -450,7 +632,11 @@ def build_app(session_id: Optional[str] = None) -> FastAPI:
 
     @app.get("/")
     async def index():
-        return FileResponse(str(WEB_DIR / "index.html"))
+        # Log-found fix: browsers cached stale index.html (old ?v= pins) so
+        # users kept running old CSS/JS after an update ("interface stopped").
+        # Never cache the shell — the ?v= assets themselves stay cacheable.
+        return FileResponse(str(WEB_DIR / "index.html"),
+                            headers={"Cache-Control": "no-store, must-revalidate"})
 
     return app
 
