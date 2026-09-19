@@ -5,7 +5,11 @@
 nexus.log
 nexus.log.*
 
+# testing prompts
+system_promptV2.txt
+
 # python noise
 __pycache__/
 *.pyc
 .venv/
+.vevn/
